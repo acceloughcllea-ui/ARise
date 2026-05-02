@@ -7,658 +7,1254 @@ type Bindings = {
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
-
 app.use('/api/*', cors())
 
-// ====================================================================
-// 内存映射(开发环境兜底) —— 生产环境优先用 Cloudflare KV
-// ====================================================================
-const memoryStore = new Map<string, { art: string; text: string; createdAt: number }>()
+// ========== 内存兜底 ==========
+const memoryStore = new Map<string, EchoRecord>()
 
-// ====================================================================
-// API: 调用 HuggingFace Flux.1-schnell 生成艺术图片
-// ====================================================================
+type EchoRecord = {
+  art: string         // data URL of generated image
+  text: string        // user's whisper
+  voice: string       // style key
+  title: string       // generated poetic title
+  curatorNote: string // generated curator's note
+  createdAt: number
+}
+
+// ========== 风格定义 ==========
+const VOICES: Record<string, { label: string; prompt: string; palette: string }> = {
+  'sun-bleached': {
+    label: 'Sun-bleached memory',
+    prompt: 'sun-faded film photograph aesthetic, warm amber and gold leaf tones, hazy summer light, grainy texture, washed-out highlights, dreamlike nostalgia, soft golden hour glow',
+    palette: '#D4AF7A',
+  },
+  'underwater': {
+    label: 'Underwater dream',
+    prompt: 'underwater dream aesthetic, refracted teal and sapphire light, soft caustic patterns, weightless suspension, blurred edges as if seen through deep water, ethereal aquatic surrealism',
+    palette: '#7AB8D4',
+  },
+  'velvet-midnight': {
+    label: 'Velvet midnight',
+    prompt: 'velvet midnight aesthetic, deep indigo and violet tones, scattered stardust, soft moonlit glow, cosmic surrealism, gentle bokeh, intimate nocturnal quietude',
+    palette: '#9F7AEA',
+  },
+  'pressed-flower': {
+    label: 'Pressed flower',
+    prompt: 'pressed flower aesthetic, faded sepia and dusty rose tones, aged paper texture, botanical illustration sensibility, delicate translucent petals, vintage herbarium specimen quality',
+    palette: '#C9A4A4',
+  },
+}
+
+// ========== 标题与策展人评语生成 ==========
+function generateTitle(text: string): string {
+  const cleaned = text.trim().replace(/[.,;:!?…—-]+$/g, '')
+  const words = cleaned.split(/\s+/).slice(0, 4).join(' ')
+  return words.charAt(0).toUpperCase() + words.slice(1)
+}
+
+const NOTE_FRAGMENTS = [
+  'a study in fading light',
+  'on the architecture of remembering',
+  'where silence becomes a color',
+  'a small monument to a soft hour',
+  'translation of a private weather',
+  'an essay in the language of dust',
+  'the texture of an almost-forgotten room',
+  'cartography of an inner season',
+  'a quiet refusal to be summarized',
+  'notes on the gravity of small things',
+  'an inventory of what was nearly said',
+]
+function generateCuratorNote(seed: string): string {
+  let h = 0
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0
+  return NOTE_FRAGMENTS[h % NOTE_FRAGMENTS.length]
+}
+
+function formatEchoNumber(id: string, createdAt: number): string {
+  const d = new Date(createdAt)
+  const yyyy = d.getUTCFullYear()
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0')
+  const dd = String(d.getUTCDate()).padStart(2, '0')
+  return `№ A-${yyyy}.${mm}.${dd} / ${id}`
+}
+
+// ========== AI 生成 ==========
 app.post('/api/generate', async (c) => {
   try {
-    const body = await c.req.json<{ image?: string; text?: string }>()
-    const { image: userImage, text: memoryText } = body
+    const body = await c.req.json<{ text?: string; voice?: string }>()
+    const memoryText = (body.text || '').trim()
+    const voiceKey = body.voice && VOICES[body.voice] ? body.voice : 'velvet-midnight'
 
-    if (!memoryText) {
-      return c.json({ error: '请输入记忆文字' }, 400)
-    }
+    if (!memoryText) return c.json({ error: 'Whisper cannot be empty' }, 400)
 
+    const voice = VOICES[voiceKey]
     const HF_TOKEN = c.env.HF_TOKEN || ''
 
-    // 高度优化的艺术化 Prompt（双重曝光 + 水彩 + 极简构图）
-    const artPrompt = `aesthetic digital art, ${memoryText}, double exposure effect, blend of grainy film texture and soft watercolor gradients, dreamlike surrealism, minimalist composition, muted pastel color palette with gold leaf accents, ethereal lighting, 4k resolution, artistic masterpiece, no distorted features`
+    const artPrompt = `${voice.prompt}, inspired by the memory: "${memoryText}", abstract figurative art, double exposure, museum-quality fine art, painterly, no human faces, no text, no letters, no signature, vertical composition, evocative atmosphere, masterful composition`
 
     let base64Image: string
 
     if (HF_TOKEN) {
-      // 调用 HuggingFace Flux.1-schnell（免费推理端点）
       const hfResponse = await fetch(
         'https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell',
         {
           method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${HF_TOKEN}`,
-            'Content-Type': 'application/json',
-          },
+          headers: { 'Authorization': `Bearer ${HF_TOKEN}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             inputs: artPrompt,
-            parameters: {
-              num_inference_steps: 4,
-              guidance_scale: 0.0,
-              width: 768,
-              height: 1024,
-            },
+            parameters: { num_inference_steps: 4, guidance_scale: 0.0, width: 768, height: 1024 },
           }),
         }
       )
-
       if (!hfResponse.ok) {
         const errText = await hfResponse.text()
-        return c.json({
-          error: 'HuggingFace API 调用失败',
-          detail: errText,
-          hint: '若是冷启动 503,请 20 秒后重试'
-        }, 502)
+        return c.json({ error: 'AI service unavailable', detail: errText, hint: 'Cold start may take ~20s. Retry once.' }, 502)
       }
-
       const arrayBuffer = await hfResponse.arrayBuffer()
       const bytes = new Uint8Array(arrayBuffer)
       let binary = ''
       for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
       base64Image = `data:image/png;base64,${btoa(binary)}`
     } else {
-      // 无 token 时使用占位图(SVG 渐变 + 文字),让前端流程仍能跑通
-      const placeholderSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="768" height="1024" viewBox="0 0 768 1024">
-        <defs>
-          <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stop-color="#6B46C1"/>
-            <stop offset="50%" stop-color="#9F7AEA"/>
-            <stop offset="100%" stop-color="#E9D8FD"/>
-          </linearGradient>
-          <radialGradient id="r" cx="0.5" cy="0.4" r="0.6">
-            <stop offset="0%" stop-color="#FFD700" stop-opacity="0.4"/>
-            <stop offset="100%" stop-color="#FFD700" stop-opacity="0"/>
-          </radialGradient>
-        </defs>
-        <rect width="768" height="1024" fill="url(#g)"/>
-        <rect width="768" height="1024" fill="url(#r)"/>
-        <text x="384" y="500" font-family="serif" font-size="48" fill="white" text-anchor="middle" opacity="0.85">Echo Memory</text>
-        <text x="384" y="560" font-family="serif" font-size="24" fill="white" text-anchor="middle" opacity="0.6">(Demo · Set HF_TOKEN to enable AI)</text>
-      </svg>`
-      base64Image = `data:image/svg+xml;base64,${btoa(placeholderSvg)}`
+      base64Image = makePlaceholderArt(voice.palette, voiceKey)
     }
 
-    // 生成唯一 ID 并存储映射
     const id = crypto.randomUUID().slice(0, 8)
-    const record = { art: base64Image, text: memoryText, createdAt: Date.now() }
+    const record: EchoRecord = {
+      art: base64Image,
+      text: memoryText,
+      voice: voiceKey,
+      title: generateTitle(memoryText),
+      curatorNote: generateCuratorNote(memoryText + voiceKey),
+      createdAt: Date.now(),
+    }
 
     if (c.env.ECHO_KV) {
-      await c.env.ECHO_KV.put(`echo:${id}`, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 7 })
+      await c.env.ECHO_KV.put(`echo:${id}`, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 })
     } else {
       memoryStore.set(id, record)
     }
 
-    return c.json({ id, art: base64Image, text: memoryText })
+    return c.json({ id, ...record, number: formatEchoNumber(id, record.createdAt), voiceLabel: voice.label })
   } catch (e: any) {
     return c.json({ error: e?.message || 'Internal error' }, 500)
   }
 })
 
-// 取回某条 echo 记录(供 AR 场景动态加载)
+function makePlaceholderArt(palette: string, voiceKey: string): string {
+  // 给四种风格各一种独特的 SVG 占位艺术
+  const variants: Record<string, string> = {
+    'sun-bleached': `<defs><radialGradient id="g" cx="50%" cy="35%" r="70%"><stop offset="0%" stop-color="#F5DEB3"/><stop offset="50%" stop-color="${palette}"/><stop offset="100%" stop-color="#3a2818"/></radialGradient></defs><rect width="768" height="1024" fill="url(#g)"/><circle cx="384" cy="360" r="220" fill="#FFE9C4" opacity="0.18"/><circle cx="384" cy="360" r="140" fill="#FFE9C4" opacity="0.12"/>`,
+    'underwater': `<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a4d6b"/><stop offset="50%" stop-color="${palette}"/><stop offset="100%" stop-color="#0a1a2a"/></linearGradient></defs><rect width="768" height="1024" fill="url(#g)"/><path d="M 0 300 Q 200 250 400 320 T 800 300" stroke="#fff" stroke-width="1" fill="none" opacity="0.15"/><path d="M 0 500 Q 200 450 400 520 T 800 500" stroke="#fff" stroke-width="1" fill="none" opacity="0.12"/><path d="M 0 700 Q 200 650 400 720 T 800 700" stroke="#fff" stroke-width="1" fill="none" opacity="0.1"/>`,
+    'velvet-midnight': `<defs><radialGradient id="g" cx="50%" cy="40%" r="80%"><stop offset="0%" stop-color="#5a3a8a"/><stop offset="50%" stop-color="${palette}"/><stop offset="100%" stop-color="#0a0420"/></radialGradient></defs><rect width="768" height="1024" fill="url(#g)"/><g fill="#fff"><circle cx="120" cy="180" r="1.2" opacity="0.7"/><circle cx="280" cy="90" r="0.8" opacity="0.5"/><circle cx="480" cy="220" r="1" opacity="0.6"/><circle cx="620" cy="120" r="1.4" opacity="0.8"/><circle cx="180" cy="320" r="0.6" opacity="0.4"/><circle cx="540" cy="380" r="0.9" opacity="0.5"/><circle cx="700" cy="260" r="1" opacity="0.6"/><circle cx="80" cy="450" r="0.7" opacity="0.4"/></g>`,
+    'pressed-flower': `<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#e8d8c8"/><stop offset="100%" stop-color="${palette}"/></linearGradient></defs><rect width="768" height="1024" fill="url(#g)"/><g stroke="#7a5050" stroke-width="0.8" fill="none" opacity="0.35"><path d="M 384 700 Q 380 500 384 350"/><path d="M 384 450 Q 320 420 280 380"/><path d="M 384 480 Q 450 450 490 410"/><circle cx="280" cy="380" r="22" fill="#a06870" opacity="0.5"/><circle cx="490" cy="410" r="18" fill="#a06870" opacity="0.5"/><circle cx="384" cy="350" r="26" fill="#9a5060" opacity="0.55"/></g>`,
+  }
+  const inner = variants[voiceKey] || variants['velvet-midnight']
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="768" height="1024" viewBox="0 0 768 1024">${inner}</svg>`
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+}
+
 app.get('/api/echo/:id', async (c) => {
   const id = c.req.param('id')
-  let record: { art: string; text: string; createdAt: number } | null = null
-
+  let record: EchoRecord | null = null
   if (c.env.ECHO_KV) {
     const raw = await c.env.ECHO_KV.get(`echo:${id}`)
     if (raw) record = JSON.parse(raw)
   } else {
     record = memoryStore.get(id) || null
   }
-
   if (!record) return c.json({ error: 'Not found' }, 404)
-  return c.json(record)
+  const voice = VOICES[record.voice] || VOICES['velvet-midnight']
+  return c.json({ id, ...record, number: formatEchoNumber(id, record.createdAt), voiceLabel: voice.label, palette: voice.palette })
 })
 
-// ====================================================================
-// 主入口页：NFC 触发后落地的"创作 + 扫描"中心
-// ====================================================================
-app.get('/', (c) => {
-  return c.html(`<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
+// ===================================================================
+// 共用 head:字体 + 全站基调样式
+// ===================================================================
+const sharedHead = `
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>ARise · EchoCards</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;1,300;1,400&family=Inter:wght@300;400;500&display=swap" rel="stylesheet">
+<link rel="icon" type="image/svg+xml" href="/favicon.ico">
 <style>
-  :root { --arise-purple: #6B46C1; --arise-violet: #9F7AEA; --arise-gold: #D4AF7A; }
-  body { font-family: 'Inter', system-ui, sans-serif; background: #0a0a0f; color: #fff; min-height: 100vh; }
-  .serif { font-family: 'Playfair Display', serif; }
-  .gradient-bg {
+  :root {
+    --bg: #0a0612;
+    --bg-deep: #050309;
+    --ink: #f5ede0;
+    --ink-soft: rgba(245,237,224,0.6);
+    --ink-faint: rgba(245,237,224,0.3);
+    --violet: #9F7AEA;
+    --gold: #D4AF7A;
+    --line: rgba(245,237,224,0.12);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; background: var(--bg); color: var(--ink); }
+  body { font-family: 'Inter', system-ui, sans-serif; font-weight: 300; -webkit-font-smoothing: antialiased; overflow-x: hidden; }
+  .serif { font-family: 'Cormorant Garamond', 'Times New Roman', serif; font-weight: 300; }
+  .serif-italic { font-family: 'Cormorant Garamond', serif; font-style: italic; font-weight: 300; }
+  .uppercase-tracked { text-transform: uppercase; letter-spacing: 0.28em; font-size: 11px; font-weight: 400; }
+  a { color: inherit; text-decoration: none; }
+  .gold { color: var(--gold); }
+  .violet { color: var(--violet); }
+  .ink-soft { color: var(--ink-soft); }
+  .ink-faint { color: var(--ink-faint); }
+  /* 通用细金线分隔 */
+  .hairline { display:block; height:1px; background: linear-gradient(90deg, transparent, var(--gold), transparent); opacity: 0.5; }
+  .hairline-short { width: 40px; height: 1px; background: var(--gold); opacity: 0.7; }
+  /* 滚动条隐藏 */
+  ::-webkit-scrollbar { width: 0; height: 0; }
+</style>
+`
+
+// ===================================================================
+// /  · The Threshold 入境页
+// ===================================================================
+app.get('/', (c) => {
+  return c.html(`<!DOCTYPE html>
+<html lang="en">
+<head>
+${sharedHead}
+<title>ARise · An Echo Gallery</title>
+<style>
+  body { background: var(--bg-deep); }
+  .threshold {
+    min-height: 100vh; min-height: 100dvh;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    position: relative; padding: 40px 24px;
     background:
-      radial-gradient(circle at 20% 10%, rgba(107,70,193,0.55) 0%, transparent 45%),
-      radial-gradient(circle at 80% 80%, rgba(159,122,234,0.45) 0%, transparent 50%),
-      radial-gradient(circle at 50% 50%, rgba(212,175,122,0.15) 0%, transparent 60%),
-      #0a0a0f;
+      radial-gradient(circle at 50% 45%, rgba(159,122,234,0.22) 0%, transparent 38%),
+      radial-gradient(circle at 50% 45%, rgba(212,175,122,0.12) 0%, transparent 28%),
+      var(--bg-deep);
+    overflow: hidden;
   }
-  .glass { background: rgba(255,255,255,0.05); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,0.08); }
-  .btn-primary {
-    background: linear-gradient(135deg, var(--arise-purple), var(--arise-violet));
-    transition: all .3s ease;
+  /* 呼吸光晕 */
+  .halo {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: 900px; height: 900px; max-width: 140vw; max-height: 140vw;
+    border-radius: 50%; pointer-events: none;
+    background: radial-gradient(circle, rgba(159,122,234,0.18) 0%, transparent 60%);
+    animation: breathe 7s ease-in-out infinite;
+    filter: blur(20px);
   }
-  .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 12px 32px rgba(107,70,193,0.5); }
-  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-  .logo-mark {
-    width: 56px; height: 56px;
-    background: linear-gradient(135deg, var(--arise-purple), var(--arise-violet));
-    -webkit-mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path d="M50 10 L85 88 L70 88 L62 70 L38 70 L30 88 L15 88 Z M44 56 L56 56 L50 32 Z" fill="black"/></svg>') center/contain no-repeat;
-    mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path d="M50 10 L85 88 L70 88 L62 70 L38 70 L30 88 L15 88 Z M44 56 L56 56 L50 32 Z" fill="black"/></svg>') center/contain no-repeat;
+  @keyframes breathe {
+    0%, 100% { transform: translate(-50%, -50%) scale(0.85); opacity: 0.6; }
+    50% { transform: translate(-50%, -50%) scale(1.05); opacity: 1; }
   }
-  .pulse-glow { animation: pulse 2.5s ease-in-out infinite; }
-  @keyframes pulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(159,122,234,0.6); }
-    50% { box-shadow: 0 0 0 24px rgba(159,122,234,0); }
+  /* 缓慢旋转的金圈装饰 */
+  .ring {
+    position: absolute; top: 50%; left: 50%; pointer-events: none;
+    border: 1px solid rgba(212,175,122,0.18); border-radius: 50%;
+    transform: translate(-50%,-50%);
+    animation: rotate 80s linear infinite;
   }
-  .step-line { background: linear-gradient(180deg, var(--arise-violet), transparent); }
-  textarea, input[type=file] { color-scheme: dark; }
-  #photoPreview { background: repeating-linear-gradient(45deg, rgba(255,255,255,0.02) 0 6px, transparent 6px 12px); }
-  .loader-ring {
-    width: 64px; height: 64px;
-    border: 3px solid rgba(159,122,234,0.2);
-    border-top-color: var(--arise-violet);
-    border-radius: 50%;
-    animation: spin 0.9s linear infinite;
+  .ring.r1 { width: 520px; height: 520px; }
+  .ring.r2 { width: 720px; height: 720px; border-color: rgba(212,175,122,0.1); animation-duration: 140s; animation-direction: reverse; }
+  @keyframes rotate { to { transform: translate(-50%,-50%) rotate(360deg); } }
+
+  .top-mark {
+    position: absolute; top: 36px; left: 50%; transform: translateX(-50%);
+    text-align: center; opacity: 0; animation: fade-in 1.6s 0.2s forwards;
   }
-  @keyframes spin { to { transform: rotate(360deg); } }
+  .top-mark .brand { font-family: 'Cormorant Garamond', serif; font-size: 22px; letter-spacing: 0.04em; }
+  .top-mark .sub { font-size: 10px; letter-spacing: 0.4em; color: var(--ink-faint); margin-top: 4px; text-transform: uppercase; }
+
+  .core {
+    position: relative; z-index: 2; text-align: center; max-width: 640px;
+    opacity: 0; animation: fade-up 1.8s 0.6s forwards;
+  }
+  .core .eyebrow {
+    color: var(--gold); font-size: 10.5px; letter-spacing: 0.5em;
+    text-transform: uppercase; margin-bottom: 32px;
+  }
+  .core h1 {
+    font-family: 'Cormorant Garamond', serif; font-style: italic; font-weight: 300;
+    font-size: clamp(36px, 7vw, 64px); line-height: 1.18; margin: 0 0 28px;
+    color: var(--ink);
+  }
+  .core h1 .accent { color: var(--gold); }
+  .core .lede {
+    font-size: 14px; line-height: 1.85; color: var(--ink-soft);
+    max-width: 440px; margin: 0 auto 48px; font-weight: 300;
+  }
+
+  .enter-btn {
+    display: inline-flex; align-items: center; gap: 14px;
+    padding: 16px 34px; border: 1px solid rgba(212,175,122,0.5);
+    background: transparent; color: var(--gold);
+    font-size: 11px; letter-spacing: 0.4em; text-transform: uppercase;
+    cursor: pointer; transition: all .8s cubic-bezier(0.2, 0.8, 0.2, 1);
+    border-radius: 0; font-family: inherit;
+  }
+  .enter-btn:hover { background: rgba(212,175,122,0.08); border-color: var(--gold); padding-left: 44px; padding-right: 44px; }
+  .enter-btn .arrow { transition: transform .6s ease; }
+  .enter-btn:hover .arrow { transform: translateX(6px); }
+
+  .scroll-cue {
+    position: absolute; bottom: 36px; left: 50%; transform: translateX(-50%);
+    text-align: center; opacity: 0; animation: fade-in 2s 2s forwards;
+  }
+  .scroll-cue .line {
+    width: 1px; height: 40px; background: linear-gradient(180deg, transparent, var(--gold));
+    margin: 0 auto 10px; animation: drop 2.4s ease-in-out infinite;
+  }
+  @keyframes drop { 0%,100%{transform:scaleY(0.4);transform-origin:top} 50%{transform:scaleY(1);transform-origin:top} }
+  .scroll-cue .label { font-size: 9.5px; letter-spacing: 0.4em; color: var(--ink-faint); text-transform: uppercase; }
+
+  /* 第二屏:介绍三幕 */
+  .acts {
+    background: var(--bg-deep);
+    padding: 140px 24px 120px;
+    border-top: 1px solid var(--line);
+  }
+  .acts-inner { max-width: 720px; margin: 0 auto; }
+  .acts h2 {
+    font-family: 'Cormorant Garamond', serif; font-style: italic;
+    font-size: clamp(28px, 4.5vw, 38px); font-weight: 300;
+    text-align: center; margin: 0 0 80px;
+  }
+  .act-row {
+    display: grid; grid-template-columns: 60px 1fr; gap: 28px;
+    padding: 36px 0; border-top: 1px solid var(--line);
+    align-items: start;
+  }
+  .act-row:last-child { border-bottom: 1px solid var(--line); }
+  .act-num { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 36px; color: var(--gold); line-height: 1; }
+  .act-title { font-family: 'Cormorant Garamond', serif; font-size: 22px; margin: 0 0 10px; color: var(--ink); }
+  .act-title .en { color: var(--ink-faint); font-size: 12px; letter-spacing: 0.3em; text-transform: uppercase; margin-left: 14px;}
+  .act-desc { font-size: 13.5px; line-height: 1.85; color: var(--ink-soft); margin: 0; }
+
+  .closing {
+    text-align: center; padding: 90px 24px 100px;
+    border-top: 1px solid var(--line);
+  }
+  .closing p { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 18px; color: var(--ink-soft); margin: 0 0 8px; }
+  .closing .sig { font-size: 10px; letter-spacing: 0.4em; color: var(--ink-faint); text-transform: uppercase; }
+
+  @keyframes fade-in { to { opacity: 1; } }
+  @keyframes fade-up { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
 </style>
 </head>
-<body class="gradient-bg">
-<main class="max-w-md mx-auto px-5 py-8">
+<body>
 
-  <!-- HEADER -->
-  <header class="flex items-center justify-between mb-10">
-    <div class="flex items-center gap-3">
-      <div class="logo-mark"></div>
-      <div>
-        <h1 class="serif text-2xl font-bold leading-none">ARise</h1>
-        <p class="text-xs text-white/50 mt-1 tracking-widest uppercase">Echo Cards</p>
-      </div>
-    </div>
-    <a href="/scan" class="glass px-3 py-2 rounded-full text-xs flex items-center gap-2">
-      <i class="fas fa-camera"></i> Scan
-    </a>
-  </header>
+<section class="threshold">
+  <div class="halo"></div>
+  <div class="ring r1"></div>
+  <div class="ring r2"></div>
 
-  <!-- HERO -->
-  <section id="hero-section" class="text-center mb-10">
-    <h2 class="serif italic text-3xl leading-tight mb-3">
-      Your memory,<br/>reborn as art.
-    </h2>
-    <p class="text-white/60 text-sm leading-relaxed px-2">
-      上传一张照片,写下属于它的一句话 ——<br/>AI 将把它转化为一幅悬浮于卡片之上的艺术画。
+  <div class="top-mark">
+    <div class="brand">ARise</div>
+    <div class="sub">An Echo Gallery</div>
+  </div>
+
+  <div class="core">
+    <div class="eyebrow">Volume I &nbsp;·&nbsp; MMXXVI</div>
+    <h1>
+      Whisper a memory.<br/>
+      We'll turn it<br/>
+      into <span class="accent serif-italic">light.</span>
+    </h1>
+    <p class="lede">
+      A small, quiet ritual: a sentence becomes a painting,
+      a painting becomes a room,
+      a room becomes yours alone — and yet, shareable.
     </p>
-  </section>
+    <a href="/create" class="enter-btn">
+      <span>Enter the Gallery</span>
+      <span class="arrow">→</span>
+    </a>
+  </div>
 
-  <!-- CREATE FLOW -->
-  <section id="create-section" class="glass rounded-3xl p-6 mb-6">
-    <div class="flex items-center gap-3 mb-5">
-      <span class="serif text-3xl text-white/30">01</span>
-      <h3 class="text-lg font-semibold">Capture a moment</h3>
+  <div class="scroll-cue">
+    <div class="line"></div>
+    <div class="label">Scroll</div>
+  </div>
+</section>
+
+<section class="acts">
+  <div class="acts-inner">
+    <h2>Three quiet acts.</h2>
+
+    <div class="act-row">
+      <div class="act-num">i</div>
+      <div>
+        <h3 class="act-title">The Whisper <span class="en">Act One</span></h3>
+        <p class="act-desc">
+          You offer a fragment — a photograph, a sentence, the color of an hour.
+          Nothing is asked of you that you wouldn't already say to a window.
+        </p>
+      </div>
     </div>
 
-    <label for="photoInput" class="block cursor-pointer">
-      <div id="photoPreview" class="w-full aspect-[3/4] rounded-2xl border border-dashed border-white/20 flex flex-col items-center justify-center text-white/50 overflow-hidden mb-4 relative">
-        <i class="fas fa-image text-4xl mb-3 opacity-60"></i>
-        <span class="text-sm">Tap to upload photo</span>
-        <span class="text-xs opacity-50 mt-1">JPG / PNG · &lt; 5MB</span>
+    <div class="act-row">
+      <div class="act-num">ii</div>
+      <div>
+        <h3 class="act-title">The Reveal <span class="en">Act Two</span></h3>
+        <p class="act-desc">
+          A light descends. The wall warms. Your memory steps forward —
+          framed, named, lit — as if it had always belonged to a museum
+          you didn't know you were building.
+        </p>
       </div>
+    </div>
+
+    <div class="act-row">
+      <div class="act-num">iii</div>
+      <div>
+        <h3 class="act-title">The Trace <span class="en">Act Three</span></h3>
+        <p class="act-desc">
+          A ticket. A signature. A link you can press into someone's palm.
+          They open it and stand, briefly, in the same soft weather as you.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="closing">
+  <p>"Memory is not stored. It is whispered."</p>
+  <div class="sig">— ARise, curator's foreword</div>
+  <div style="margin-top: 56px;">
+    <a href="/create" class="enter-btn">
+      <span>Begin</span>
+      <span class="arrow">→</span>
+    </a>
+  </div>
+</section>
+
+</body>
+</html>`)
+})
+
+// ===================================================================
+// /create  · The Whisper 创作页(三屏 scroll-driven)
+// ===================================================================
+app.get('/create', (c) => {
+  const voicesJson = JSON.stringify(
+    Object.entries(VOICES).map(([k, v]) => ({ key: k, label: v.label, palette: v.palette }))
+  )
+  return c.html(`<!DOCTYPE html>
+<html lang="en">
+<head>
+${sharedHead}
+<title>ARise · The Whisper</title>
+<style>
+  body { background: var(--bg-deep); overflow-y: scroll; scroll-behavior: smooth; }
+
+  /* 顶部进度 */
+  .progress-bar {
+    position: fixed; top: 0; left: 0; right: 0; height: 1px;
+    background: var(--line); z-index: 100;
+  }
+  .progress-fill {
+    height: 100%; background: var(--gold); width: 0%;
+    transition: width .8s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .top-nav {
+    position: fixed; top: 22px; left: 0; right: 0; z-index: 99;
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 0 28px; pointer-events: none;
+  }
+  .top-nav a, .top-nav span { pointer-events: auto; font-size: 10.5px; letter-spacing: 0.32em; text-transform: uppercase; color: var(--ink-faint); }
+  .top-nav a:hover { color: var(--gold); }
+
+  /* 每个 chapter 全屏 */
+  .chapter {
+    min-height: 100vh; min-height: 100dvh;
+    display: flex; align-items: center; justify-content: center;
+    padding: 80px 24px; position: relative;
+  }
+  .chapter-inner { width: 100%; max-width: 600px; text-align: center; }
+  .chapter-num {
+    font-family: 'Cormorant Garamond', serif; font-style: italic;
+    font-size: 14px; color: var(--gold); letter-spacing: 0.3em;
+    margin-bottom: 14px;
+  }
+  .chapter-title {
+    font-family: 'Cormorant Garamond', serif; font-style: italic; font-weight: 300;
+    font-size: clamp(32px, 6vw, 48px); margin: 0 0 18px; line-height: 1.2;
+  }
+  .chapter-sub {
+    font-size: 13px; color: var(--ink-soft); line-height: 1.85;
+    max-width: 380px; margin: 0 auto 50px;
+  }
+
+  /* Chapter I — Fragment 上传 */
+  .fragment-zone {
+    position: relative; width: 220px; height: 280px; margin: 0 auto;
+    border: 1px dashed rgba(212,175,122,0.3);
+    display: flex; align-items: center; justify-content: center; cursor: pointer;
+    transition: all .6s ease; overflow: hidden;
+  }
+  .fragment-zone:hover { border-color: var(--gold); }
+  .fragment-zone .plus {
+    font-family: 'Cormorant Garamond', serif; font-size: 56px; font-weight: 300;
+    color: var(--gold); opacity: 0.8;
+  }
+  .fragment-zone .hint {
+    position: absolute; bottom: 16px; left: 0; right: 0;
+    font-size: 9.5px; letter-spacing: 0.3em; text-transform: uppercase; color: var(--ink-faint);
+  }
+  .fragment-zone.has-image .plus, .fragment-zone.has-image .hint { display: none; }
+  .fragment-orb {
+    position: absolute; inset: 0;
+    background-size: cover; background-position: center;
+    filter: blur(14px) saturate(1.2);
+    transform: scale(1.2);
+    opacity: 0;
+    transition: opacity 1s ease;
+  }
+  .fragment-zone.has-image .fragment-orb { opacity: 0.85; }
+  .fragment-zone.has-image::after {
+    content: ''; position: absolute; inset: 0;
+    background: radial-gradient(circle at 50% 50%, transparent 30%, rgba(10,6,18,0.9) 80%);
+  }
+  .fragment-status {
+    margin-top: 24px; font-size: 11.5px; letter-spacing: 0.2em;
+    color: var(--ink-faint); text-transform: uppercase; min-height: 14px;
+  }
+  .fragment-zone.has-image ~ .fragment-status { color: var(--gold); }
+  .skip-link {
+    display: inline-block; margin-top: 36px;
+    font-size: 10.5px; letter-spacing: 0.3em; color: var(--ink-faint);
+    text-transform: uppercase; cursor: pointer;
+    border-bottom: 1px solid var(--line); padding-bottom: 4px;
+  }
+  .skip-link:hover { color: var(--gold); border-color: var(--gold); }
+
+  /* Chapter II — Echo 文字 */
+  .echo-input-wrap {
+    position: relative; max-width: 480px; margin: 0 auto;
+    border-bottom: 1px solid var(--line);
+    padding: 16px 0 12px;
+    transition: border-color .6s ease;
+  }
+  .echo-input-wrap:focus-within { border-color: var(--gold); }
+  .echo-input {
+    width: 100%; background: transparent; border: 0; outline: 0;
+    font-family: 'Cormorant Garamond', serif; font-style: italic; font-weight: 300;
+    font-size: 22px; color: var(--ink); text-align: center;
+    line-height: 1.5; resize: none;
+    min-height: 80px;
+  }
+  .echo-input::placeholder { color: var(--ink-faint); font-style: italic; }
+  .echo-meta { display: flex; justify-content: space-between; align-items: center; margin-top: 14px; padding: 0 4px; }
+  .echo-counter { font-size: 10px; letter-spacing: 0.25em; color: var(--ink-faint); text-transform: uppercase; }
+
+  /* Chapter III — Voice 风格选择 */
+  .voices {
+    display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px;
+    max-width: 480px; margin: 0 auto 36px;
+  }
+  .voice {
+    position: relative; padding: 22px 16px 20px;
+    border: 1px solid var(--line); cursor: pointer;
+    transition: all .5s ease; text-align: left;
+    background: rgba(255,255,255,0.01);
+  }
+  .voice:hover { border-color: rgba(212,175,122,0.5); transform: translateY(-2px); }
+  .voice.active { border-color: var(--gold); background: rgba(212,175,122,0.05); }
+  .voice .swatch {
+    width: 28px; height: 28px; border-radius: 50%;
+    margin-bottom: 12px; box-shadow: 0 0 16px var(--swatch-color);
+  }
+  .voice .name {
+    font-family: 'Cormorant Garamond', serif; font-style: italic;
+    font-size: 17px; color: var(--ink); margin: 0;
+  }
+  .voice .key {
+    font-size: 9px; letter-spacing: 0.3em; color: var(--ink-faint);
+    text-transform: uppercase; margin-top: 6px;
+  }
+  .voice.active .key { color: var(--gold); }
+
+  /* 召唤按钮(沿用入境页风格) */
+  .summon-btn {
+    display: inline-flex; align-items: center; gap: 14px;
+    padding: 16px 38px; border: 1px solid rgba(212,175,122,0.5);
+    background: transparent; color: var(--gold);
+    font-size: 11px; letter-spacing: 0.4em; text-transform: uppercase;
+    cursor: pointer; transition: all .8s cubic-bezier(0.2, 0.8, 0.2, 1);
+    font-family: inherit;
+  }
+  .summon-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+  .summon-btn:not(:disabled):hover { background: rgba(212,175,122,0.08); padding-left: 48px; padding-right: 48px; }
+
+  /* 加载遮罩 */
+  .loader-veil {
+    position: fixed; inset: 0; background: rgba(5,3,9,0.95);
+    z-index: 200; display: none; align-items: center; justify-content: center; flex-direction: column;
+    backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+  }
+  .loader-veil.on { display: flex; }
+  .loader-orb {
+    width: 80px; height: 80px; border-radius: 50%; margin-bottom: 36px;
+    background: radial-gradient(circle, var(--violet) 0%, transparent 70%);
+    animation: orb-pulse 2.4s ease-in-out infinite;
+  }
+  @keyframes orb-pulse {
+    0%,100% { transform: scale(0.85); opacity: 0.6; }
+    50% { transform: scale(1.15); opacity: 1; }
+  }
+  .loader-text {
+    font-family: 'Cormorant Garamond', serif; font-style: italic;
+    font-size: 22px; color: var(--ink); transition: opacity 1s ease;
+  }
+  .loader-sub { margin-top: 16px; font-size: 10px; letter-spacing: 0.4em; color: var(--ink-faint); text-transform: uppercase; }
+</style>
+</head>
+<body>
+
+<div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+
+<nav class="top-nav">
+  <a href="/">ARise</a>
+  <span class="serif-italic" style="text-transform:none; letter-spacing:0.05em;">The Whisper</span>
+  <span style="opacity:0.6;">i &middot; ii &middot; iii</span>
+</nav>
+
+<!-- Chapter I: Fragment -->
+<section class="chapter" id="ch1">
+  <div class="chapter-inner">
+    <div class="chapter-num serif-italic">i. Fragment</div>
+    <h2 class="chapter-title">Choose a fragment.</h2>
+    <p class="chapter-sub">A photograph — anything. It will not be shown. It will be felt, blurred into color, dissolved into atmosphere.</p>
+
+    <label class="fragment-zone" id="fragmentZone" for="photoInput">
+      <div class="fragment-orb" id="fragmentOrb"></div>
+      <span class="plus">+</span>
+      <span class="hint">Tap to offer</span>
     </label>
-    <input id="photoInput" type="file" accept="image/*" class="hidden"/>
+    <input type="file" id="photoInput" accept="image/*" style="display:none"/>
+    <div class="fragment-status" id="fragmentStatus">&nbsp;</div>
 
-    <div class="flex items-center gap-3 mb-5 mt-8">
-      <span class="serif text-3xl text-white/30">02</span>
-      <h3 class="text-lg font-semibold">Speak its echo</h3>
+    <div>
+      <a class="skip-link" id="skipFragment">Or whisper without one →</a>
     </div>
-    <textarea id="memoryText" rows="3" maxlength="120" placeholder="The summer she taught me to swim..."
-      class="w-full glass rounded-2xl p-4 text-sm placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-violet-500/50 serif italic"></textarea>
-    <div class="text-right text-xs text-white/30 mt-1"><span id="charCount">0</span> / 120</div>
+  </div>
+</section>
 
-    <button id="generateBtn" class="btn-primary w-full mt-6 py-4 rounded-2xl font-semibold flex items-center justify-center gap-3 pulse-glow">
-      <i class="fas fa-wand-magic-sparkles"></i>
-      <span>Transmute into Art</span>
+<!-- Chapter II: Echo -->
+<section class="chapter" id="ch2">
+  <div class="chapter-inner">
+    <div class="chapter-num serif-italic">ii. Echo</div>
+    <h2 class="chapter-title">Speak its echo.</h2>
+    <p class="chapter-sub">One sentence. The shorter, the truer.</p>
+
+    <div class="echo-input-wrap">
+      <textarea id="echoInput" class="echo-input" rows="2" maxlength="140" placeholder="The summer she taught me to swim…"></textarea>
+    </div>
+    <div class="echo-meta">
+      <span class="echo-counter"><span id="echoCount">0</span> / 140</span>
+      <span class="echo-counter ink-faint" id="echoState">unwhispered</span>
+    </div>
+  </div>
+</section>
+
+<!-- Chapter III: Voice -->
+<section class="chapter" id="ch3">
+  <div class="chapter-inner">
+    <div class="chapter-num serif-italic">iii. Voice</div>
+    <h2 class="chapter-title">Choose its voice.</h2>
+    <p class="chapter-sub">Every memory has a weather. Pick the one this one wears.</p>
+
+    <div class="voices" id="voices"></div>
+
+    <button id="summonBtn" class="summon-btn" disabled>
+      <span>Summon the Echo</span>
+      <span>→</span>
     </button>
-  </section>
+  </div>
+</section>
 
-  <!-- LOADING -->
-  <section id="loading-section" class="hidden glass rounded-3xl p-10 text-center mb-6">
-    <div class="loader-ring mx-auto mb-6"></div>
-    <p class="serif italic text-lg mb-2">Listening to your memory...</p>
-    <p class="text-xs text-white/50" id="loadingHint">Flux.1 正在描绘你的故事 (5–15s)</p>
-  </section>
-
-  <!-- RESULT -->
-  <section id="result-section" class="hidden">
-    <div class="glass rounded-3xl p-5 mb-4">
-      <div class="flex items-center gap-3 mb-4">
-        <span class="serif text-3xl text-white/30">03</span>
-        <h3 class="text-lg font-semibold">Your Echo Card</h3>
-      </div>
-      <div class="rounded-2xl overflow-hidden bg-black">
-        <canvas id="finalCanvas" class="w-full block"></canvas>
-      </div>
-      <p class="text-xs text-white/40 mt-3 text-center">
-        Echo ID: <span id="echoId" class="font-mono text-white/70">—</span>
-      </p>
-    </div>
-
-    <div class="grid grid-cols-2 gap-3">
-      <a id="scanLink" href="/scan" class="btn-primary py-4 rounded-2xl text-center font-semibold flex items-center justify-center gap-2">
-        <i class="fas fa-cube"></i> View in AR
-      </a>
-      <button id="downloadBtn" class="glass py-4 rounded-2xl font-semibold flex items-center justify-center gap-2">
-        <i class="fas fa-download"></i> Save
-      </button>
-    </div>
-    <button id="retryBtn" class="w-full mt-3 py-3 text-sm text-white/50 hover:text-white">
-      <i class="fas fa-rotate-left mr-2"></i>Create another
-    </button>
-  </section>
-
-  <!-- FOOTER -->
-  <footer class="mt-12 text-center text-xs text-white/30 pb-8">
-    <p>ARise · Bringing AR Memory Experiences Without APPs</p>
-    <p class="mt-1 opacity-60">NFC · WebAR · Flux.1-schnell</p>
-  </footer>
-</main>
+<div class="loader-veil" id="loaderVeil">
+  <div class="loader-orb"></div>
+  <div class="loader-text" id="loaderText">A light is descending…</div>
+  <div class="loader-sub">Please remain still</div>
+</div>
 
 <script>
 (() => {
+  const VOICES = ${voicesJson};
   const $ = (id) => document.getElementById(id);
+
+  // 状态
+  const state = { fragment: null, text: '', voice: null };
+
+  // ---- progress ----
+  const progressFill = $('progressFill');
+  function updateProgress() {
+    const sections = ['ch1','ch2','ch3'].map(id => $(id));
+    const winH = window.innerHeight;
+    let active = 0;
+    sections.forEach((s, i) => {
+      const r = s.getBoundingClientRect();
+      if (r.top < winH * 0.5) active = i + 1;
+    });
+    progressFill.style.width = (active / 3 * 100) + '%';
+  }
+  window.addEventListener('scroll', updateProgress, { passive: true });
+  updateProgress();
+
+  // ---- Chapter I: fragment ----
   const photoInput = $('photoInput');
-  const photoPreview = $('photoPreview');
-  const memoryText = $('memoryText');
-  const charCount = $('charCount');
-  const generateBtn = $('generateBtn');
-  const createSection = $('create-section');
-  const loadingSection = $('loading-section');
-  const resultSection = $('result-section');
-  const finalCanvas = $('finalCanvas');
-  const echoIdEl = $('echoId');
-  const scanLink = $('scanLink');
-  const downloadBtn = $('downloadBtn');
-  const retryBtn = $('retryBtn');
-  const loadingHint = $('loadingHint');
-
-  let userPhotoDataURL = null;
-
-  memoryText.addEventListener('input', () => {
-    charCount.textContent = memoryText.value.length;
-  });
-
-  photoInput.addEventListener('change', async (e) => {
-    const file = e.target.files?.[0];
+  const fragmentZone = $('fragmentZone');
+  const fragmentOrb = $('fragmentOrb');
+  const fragmentStatus = $('fragmentStatus');
+  photoInput.addEventListener('change', (e) => {
+    const file = e.target.files && e.target.files[0];
     if (!file) return;
-    if (file.size > 5 * 1024 * 1024) { alert('图片需小于 5MB'); return; }
+    if (file.size > 5 * 1024 * 1024) { alert('Please choose under 5 MB'); return; }
     const reader = new FileReader();
     reader.onload = (ev) => {
-      userPhotoDataURL = ev.target.result;
-      photoPreview.innerHTML = '<img src="' + userPhotoDataURL + '" class="w-full h-full object-cover"/>';
+      state.fragment = ev.target.result;
+      fragmentOrb.style.backgroundImage = 'url("' + ev.target.result + '")';
+      fragmentZone.classList.add('has-image');
+      fragmentStatus.textContent = 'Offered';
+      // 自动滚到下一章
+      setTimeout(() => $('ch2').scrollIntoView({ behavior: 'smooth' }), 700);
     };
     reader.readAsDataURL(file);
   });
+  $('skipFragment').addEventListener('click', (e) => {
+    e.preventDefault();
+    fragmentStatus.textContent = 'Without form';
+    $('ch2').scrollIntoView({ behavior: 'smooth' });
+  });
 
-  // ============ Canvas 排版函数 ============
-  // 在 AI 生成图底部 20% 区域叠加半透明黑色遮罩 + Playfair Display 文字
-  async function composeFinalCard(artBase64, memoryStr) {
-    return new Promise((resolve) => {
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      img.onload = () => {
-        const W = img.naturalWidth || 768;
-        const H = img.naturalHeight || 1024;
-        finalCanvas.width = W;
-        finalCanvas.height = H;
-        const ctx = finalCanvas.getContext('2d');
+  // ---- Chapter II: echo ----
+  const echoInput = $('echoInput');
+  const echoCount = $('echoCount');
+  const echoState = $('echoState');
+  echoInput.addEventListener('input', () => {
+    state.text = echoInput.value;
+    echoCount.textContent = state.text.length;
+    echoState.textContent = state.text.trim() ? 'whispered' : 'unwhispered';
+    if (state.text.trim()) echoState.classList.remove('ink-faint'); else echoState.classList.add('ink-faint');
+    refreshSummon();
+  });
 
-        // 1) 绘制底图
-        ctx.drawImage(img, 0, 0, W, H);
-
-        // 2) 底部 20% 半透明遮罩(从透明渐变到 0.65 黑)
-        const maskTop = H * 0.78;
-        const maskHeight = H - maskTop;
-        const grad = ctx.createLinearGradient(0, maskTop, 0, H);
-        grad.addColorStop(0, 'rgba(0,0,0,0)');
-        grad.addColorStop(0.3, 'rgba(0,0,0,0.55)');
-        grad.addColorStop(1, 'rgba(0,0,0,0.78)');
-        ctx.fillStyle = grad;
-        ctx.fillRect(0, maskTop, W, maskHeight);
-
-        // 3) 金色细线装饰
-        ctx.strokeStyle = 'rgba(212,175,122,0.6)';
-        ctx.lineWidth = Math.max(1, W / 600);
-        ctx.beginPath();
-        ctx.moveTo(W * 0.3, H * 0.86);
-        ctx.lineTo(W * 0.7, H * 0.86);
-        ctx.stroke();
-
-        // 4) Playfair Display 文字(居中,白色,opacity 0.9)
-        ctx.fillStyle = 'rgba(255,255,255,0.92)';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        const fontSize = Math.floor(W / 22);
-        ctx.font = 'italic 400 ' + fontSize + 'px "Playfair Display", serif';
-
-        // 自动换行
-        const maxWidth = W * 0.82;
-        const words = memoryStr.split(/(\\s+)/);
-        const lines = [];
-        let line = '';
-        for (const w of words) {
-          const test = line + w;
-          if (ctx.measureText(test).width > maxWidth && line.trim()) {
-            lines.push(line.trim());
-            line = w;
-          } else { line = test; }
-        }
-        if (line.trim()) lines.push(line.trim());
-        if (lines.length > 3) {
-          lines.length = 3;
-          lines[2] = lines[2].slice(0, -1) + '…';
-        }
-
-        const lineHeight = fontSize * 1.35;
-        const startY = H * 0.91 - (lines.length - 1) * lineHeight / 2;
-        lines.forEach((ln, i) => {
-          ctx.fillText(ln, W / 2, startY + i * lineHeight);
-        });
-
-        // 5) ARise 小标识(右下角)
-        ctx.fillStyle = 'rgba(212,175,122,0.7)';
-        ctx.font = '600 ' + Math.floor(W/55) + 'px "Inter", sans-serif';
-        ctx.textAlign = 'right';
-        ctx.fillText('ARise · Echo', W - W*0.05, H - H*0.025);
-
-        resolve(finalCanvas.toDataURL('image/png'));
-      };
-      img.onerror = () => resolve(null);
-      img.src = artBase64;
+  // ---- Chapter III: voice ----
+  const voicesEl = $('voices');
+  voicesEl.innerHTML = VOICES.map(v => \`
+    <div class="voice" data-key="\${v.key}" style="--swatch-color: \${v.palette}33;">
+      <div class="swatch" style="background: \${v.palette};"></div>
+      <p class="name">\${v.label}</p>
+      <p class="key">\${v.key.replace('-', ' · ')}</p>
+    </div>
+  \`).join('');
+  voicesEl.querySelectorAll('.voice').forEach(el => {
+    el.addEventListener('click', () => {
+      voicesEl.querySelectorAll('.voice').forEach(x => x.classList.remove('active'));
+      el.classList.add('active');
+      state.voice = el.dataset.key;
+      refreshSummon();
     });
+  });
+
+  // ---- Summon ----
+  const summonBtn = $('summonBtn');
+  function refreshSummon() {
+    summonBtn.disabled = !(state.text.trim() && state.voice);
   }
 
-  // ============ 生成流程 ============
-  generateBtn.addEventListener('click', async () => {
-    const text = memoryText.value.trim();
-    if (!text) { alert('请写下你的记忆文字'); return; }
+  const loaderVeil = $('loaderVeil');
+  const loaderText = $('loaderText');
+  const LOADER_LINES = [
+    'A light is descending…',
+    'The wall is warming…',
+    'Threads of color are gathering…',
+    'A frame is being made…',
+    'Almost finished. Stay quiet.',
+  ];
 
-    createSection.classList.add('hidden');
-    loadingSection.classList.remove('hidden');
-
-    // 渐进式提示
-    const hints = [
-      'Flux.1 正在描绘你的故事…',
-      '混合双重曝光与水彩纹理…',
-      '撒上一抹金箔光…',
-      '即将完成,请稍候…'
-    ];
-    let hi = 0;
-    const hintTimer = setInterval(() => {
-      hi = (hi + 1) % hints.length;
-      loadingHint.textContent = hints[hi];
+  summonBtn.addEventListener('click', async () => {
+    if (summonBtn.disabled) return;
+    loaderVeil.classList.add('on');
+    let li = 0;
+    const lt = setInterval(() => {
+      li = (li + 1) % LOADER_LINES.length;
+      loaderText.style.opacity = '0';
+      setTimeout(() => { loaderText.textContent = LOADER_LINES[li]; loaderText.style.opacity = '1'; }, 400);
     }, 3500);
 
     try {
       const resp = await fetch('/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: userPhotoDataURL, text }),
+        body: JSON.stringify({ text: state.text.trim(), voice: state.voice }),
       });
       const data = await resp.json();
-      clearInterval(hintTimer);
-
+      clearInterval(lt);
       if (!resp.ok) {
-        alert('生成失败: ' + (data.error || resp.status) + '\\n' + (data.hint || ''));
-        loadingSection.classList.add('hidden');
-        createSection.classList.remove('hidden');
+        loaderText.textContent = (data.error || 'Something went quiet.') + ' ' + (data.hint || '');
+        setTimeout(() => loaderVeil.classList.remove('on'), 3000);
         return;
       }
-
-      // Canvas 排版
-      await composeFinalCard(data.art, data.text);
-      echoIdEl.textContent = data.id;
-      scanLink.href = '/scan?id=' + data.id;
-
-      loadingSection.classList.add('hidden');
-      resultSection.classList.remove('hidden');
-    } catch (err) {
-      clearInterval(hintTimer);
-      alert('网络错误: ' + err.message);
-      loadingSection.classList.add('hidden');
-      createSection.classList.remove('hidden');
+      // 跳转画廊
+      window.location.href = '/gallery/' + data.id;
+    } catch (e) {
+      clearInterval(lt);
+      loaderText.textContent = 'A network silence. Try again.';
+      setTimeout(() => loaderVeil.classList.remove('on'), 2500);
     }
-  });
-
-  downloadBtn.addEventListener('click', () => {
-    const url = finalCanvas.toDataURL('image/png');
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'ARise-Echo-' + echoIdEl.textContent + '.png';
-    a.click();
-  });
-
-  retryBtn.addEventListener('click', () => {
-    resultSection.classList.add('hidden');
-    createSection.classList.remove('hidden');
-    memoryText.value = '';
-    charCount.textContent = '0';
-    userPhotoDataURL = null;
-    photoPreview.innerHTML = '<i class="fas fa-image text-4xl mb-3 opacity-60"></i><span class="text-sm">Tap to upload photo</span><span class="text-xs opacity-50 mt-1">JPG / PNG · &lt; 5MB</span>';
   });
 })();
 </script>
+
 </body>
 </html>`)
 })
 
-// ====================================================================
-// AR 扫描页：A-Frame + AR.js,识别 ARise Logo Marker
-// ====================================================================
-app.get('/scan', (c) => {
-  const echoId = c.req.query('id') || ''
+// ===================================================================
+// /gallery/:id  · The Reveal 画廊页
+// ===================================================================
+app.get('/gallery/:id', (c) => {
+  const id = c.req.param('id')
   return c.html(`<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>ARise · Scan</title>
-<script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
-<script src="https://cdn.jsdelivr.net/gh/AR-js-org/AR.js@3.4.5/aframe/build/aframe-ar.js"></script>
-<script src="https://cdn.tailwindcss.com"></script>
-<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital@0;1&display=swap" rel="stylesheet">
+${sharedHead}
+<title>ARise · The Reveal</title>
 <style>
-  body, html { margin:0; padding:0; overflow:hidden; background:#000; color:#fff; font-family: system-ui, sans-serif; }
-  .a-enter-vr, .a-orientation-modal { display:none !important; }
-  #ui-overlay {
-    position: fixed; inset: 0; pointer-events: none; z-index: 10;
-    display: flex; flex-direction: column; justify-content: space-between;
+  body { background: #050309; }
+
+  /* 揭幕黑场 */
+  .curtain {
+    position: fixed; inset: 0; background: #050309; z-index: 80;
+    display: flex; align-items: center; justify-content: center;
+    transition: opacity 1.6s ease 1.6s;
   }
-  #top-bar {
+  .curtain.lift { opacity: 0; pointer-events: none; }
+  .curtain-text {
+    font-family: 'Cormorant Garamond', serif; font-style: italic;
+    font-size: 22px; color: var(--ink-soft);
+    text-align: center; opacity: 0;
+    animation: ct 4s ease forwards;
+  }
+  @keyframes ct { 0%,100%{opacity:0} 30%,70%{opacity:1} }
+
+  /* 画廊房间 */
+  .gallery-room {
+    min-height: 100vh; min-height: 100dvh;
+    position: relative; overflow: hidden;
+    perspective: 1400px;
+    display: flex; align-items: center; justify-content: center;
+    padding: 120px 24px 60px;
+    background:
+      radial-gradient(ellipse at 50% 0%, rgba(212,175,122,0.18) 0%, transparent 50%),
+      radial-gradient(ellipse at 50% 100%, rgba(159,122,234,0.12) 0%, transparent 50%),
+      #050309;
+  }
+  /* 顶部射灯光束 */
+  .spot {
+    position: absolute; top: -200px; left: 50%; transform: translateX(-50%);
+    width: 600px; height: 800px; max-width: 90vw;
+    background: radial-gradient(ellipse at 50% 0%, rgba(245,237,224,0.16) 0%, transparent 60%);
+    pointer-events: none; opacity: 0; transition: opacity 2s ease 1.4s;
+  }
+  .gallery-room.live .spot { opacity: 1; }
+
+  /* 地面反射 */
+  .floor {
+    position: absolute; bottom: 0; left: 0; right: 0; height: 30vh;
+    background: linear-gradient(180deg, transparent, rgba(159,122,234,0.04));
+    pointer-events: none;
+  }
+
+  /* 粒子尘埃 */
+  .dust { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+  .speck {
+    position: absolute; width: 2px; height: 2px; border-radius: 50%;
+    background: var(--gold); opacity: 0.5;
+    animation: float 18s linear infinite;
+  }
+  @keyframes float {
+    0% { transform: translate(0,0); opacity: 0; }
+    10% { opacity: 0.6; }
+    90% { opacity: 0.4; }
+    100% { transform: translate(40px, -120vh); opacity: 0; }
+  }
+
+  /* 顶部状态栏 */
+  .top-bar-g {
+    position: fixed; top: 22px; left: 0; right: 0; z-index: 50;
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 0 28px; pointer-events: none;
+  }
+  .top-bar-g a, .top-bar-g span {
     pointer-events: auto;
-    background: linear-gradient(180deg, rgba(0,0,0,0.8), transparent);
-    padding: 16px 18px; display: flex; align-items: center; justify-content: space-between;
+    font-size: 10.5px; letter-spacing: 0.3em; text-transform: uppercase;
+    color: var(--ink-faint);
   }
-  #top-bar a { color:#fff; text-decoration:none; font-size:14px; opacity:0.85; }
-  #status {
-    margin: 0 auto; padding: 10px 18px;
-    background: rgba(0,0,0,0.55); backdrop-filter: blur(10px);
-    border-radius: 999px; font-size: 13px;
-    border: 1px solid rgba(255,255,255,0.1);
+  .top-bar-g a:hover { color: var(--gold); }
+
+  /* 画框 + 画作 */
+  .stage {
+    position: relative; z-index: 5;
+    display: flex; flex-direction: column; align-items: center;
+    transform-style: preserve-3d;
+    opacity: 0; transform: translateY(40px);
+    transition: opacity 2s ease 2s, transform 2.4s cubic-bezier(0.2,0.8,0.2,1) 2s;
   }
-  #status .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#9F7AEA; margin-right:8px; animation: blink 1.2s infinite; }
-  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
-  #hint {
+  .gallery-room.live .stage { opacity: 1; transform: translateY(0); }
+
+  .frame-wrap {
+    position: relative;
+    transform-style: preserve-3d;
+    transition: transform 0.6s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .frame {
+    position: relative;
+    width: min(360px, 78vw);
+    aspect-ratio: 3/4;
+    background: #0a0612;
+    box-shadow:
+      0 0 0 14px #1a1208,
+      0 0 0 16px var(--gold),
+      0 40px 80px rgba(0,0,0,0.7),
+      0 80px 120px rgba(159,122,234,0.18);
+    overflow: hidden;
+    cursor: zoom-in;
+  }
+  .frame img {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+    transition: transform 8s ease;
+  }
+  .frame:hover img { transform: scale(1.04); }
+  /* 内框光泽 */
+  .frame::after {
+    content: ''; position: absolute; inset: 0;
+    background:
+      radial-gradient(ellipse at 50% -20%, rgba(245,237,224,0.18) 0%, transparent 50%),
+      radial-gradient(ellipse at 50% 120%, rgba(0,0,0,0.4) 0%, transparent 50%);
     pointer-events: none;
-    text-align: center; padding: 24px;
-    background: linear-gradient(0deg, rgba(0,0,0,0.85), transparent);
   }
-  #hint h3 { font-family:'Playfair Display', serif; font-style:italic; font-size:22px; margin-bottom:6px; }
-  #hint p { font-size:13px; opacity:0.7; }
-  #scanFrame {
-    position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
-    width: 70vw; max-width: 320px; aspect-ratio: 1;
-    border: 2px solid rgba(159,122,234,0.7);
-    border-radius: 18px;
-    box-shadow: 0 0 0 9999px rgba(0,0,0,0.35);
-    pointer-events: none;
+
+  /* 铜质标牌 */
+  .plaque {
+    margin-top: 56px; max-width: 360px; width: 78vw;
+    border: 1px solid rgba(212,175,122,0.4);
+    background: linear-gradient(135deg, rgba(212,175,122,0.06), rgba(212,175,122,0.02));
+    padding: 22px 24px 24px;
+    text-align: left;
+    position: relative;
   }
-  #scanFrame::before, #scanFrame::after,
-  #scanFrame > span::before, #scanFrame > span::after {
-    content:''; position:absolute; width: 28px; height: 28px;
-    border: 3px solid #D4AF7A;
+  .plaque::before {
+    content: ''; position: absolute; top: -1px; left: 12px; right: 12px; height: 1px;
+    background: var(--gold); opacity: 0.7;
   }
-  #scanFrame::before { top:-2px; left:-2px; border-right:0; border-bottom:0; border-radius:18px 0 0 0; }
-  #scanFrame::after { top:-2px; right:-2px; border-left:0; border-bottom:0; border-radius:0 18px 0 0; }
-  #scanFrame > span::before { content:''; position:absolute; bottom:-30px; left:-30px; border-right:0; border-top:0; border-radius:0 0 0 18px; }
-  #scanFrame > span::after { content:''; position:absolute; bottom:-30px; right:-30px; border-left:0; border-top:0; border-radius:0 0 18px 0; }
+  .plaque .num {
+    font-size: 9.5px; letter-spacing: 0.32em; text-transform: uppercase;
+    color: var(--gold); margin-bottom: 12px;
+  }
+  .plaque .title {
+    font-family: 'Cormorant Garamond', serif; font-weight: 400;
+    font-size: 26px; color: var(--ink); margin: 0 0 8px; line-height: 1.2;
+  }
+  .plaque .title em { color: var(--gold); font-style: italic; font-weight: 300; }
+  .plaque .desc {
+    font-family: 'Cormorant Garamond', serif; font-style: italic;
+    font-size: 15px; line-height: 1.6; color: var(--ink-soft);
+    margin: 0 0 18px;
+    overflow: hidden;
+    border-bottom: 1px solid var(--line); padding-bottom: 16px;
+  }
+  .plaque .meta-row { display: flex; justify-content: space-between; align-items: center; }
+  .plaque .meta-row .voice-l {
+    font-size: 9.5px; letter-spacing: 0.28em; text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .plaque .meta-row .voice-l b { color: var(--ink-soft); font-weight: 400; }
+  .plaque .meta-row .swatch-mini {
+    width: 8px; height: 8px; border-radius: 50%; display: inline-block;
+    margin-right: 8px; vertical-align: middle;
+  }
+
+  /* 票券抽屉 */
+  .ticket {
+    position: fixed; right: 24px; bottom: 24px; z-index: 40;
+    width: 280px; max-width: 80vw;
+    background: linear-gradient(135deg, #1a0e2c 0%, #0a0612 100%);
+    border: 1px solid rgba(212,175,122,0.35);
+    padding: 18px 20px;
+    transform: translateY(120%); opacity: 0;
+    transition: transform 1s cubic-bezier(0.2,0.8,0.2,1) 3.5s, opacity 1s ease 3.5s;
+  }
+  .gallery-room.live .ticket { transform: translateY(0); opacity: 1; }
+  .ticket .tnum { font-size: 9px; letter-spacing: 0.32em; text-transform: uppercase; color: var(--gold); }
+  .ticket .ttitle { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 16px; margin: 6px 0 10px; }
+  .ticket .tnote { font-size: 11px; color: var(--ink-soft); line-height: 1.6; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px dashed rgba(212,175,122,0.25); }
+  .ticket .tactions { display: flex; gap: 8px; }
+  .ticket button {
+    flex: 1; padding: 9px 8px; background: transparent;
+    border: 1px solid rgba(212,175,122,0.4);
+    color: var(--gold); font-family: inherit;
+    font-size: 9.5px; letter-spacing: 0.28em; text-transform: uppercase;
+    cursor: pointer; transition: all .4s ease;
+  }
+  .ticket button:hover { background: rgba(212,175,122,0.1); }
+  .ticket .copied { color: #b6e3b6 !important; border-color: #b6e3b6 !important; }
+  .ticket .close-x {
+    position: absolute; top: 6px; right: 10px; font-size: 14px;
+    color: var(--ink-faint); cursor: pointer; background: transparent; border: 0; padding: 4px;
+  }
+
+  /* 全屏放大 */
+  .lightbox {
+    position: fixed; inset: 0; background: rgba(5,3,9,0.95);
+    backdrop-filter: blur(20px); z-index: 90;
+    display: none; align-items: center; justify-content: center; padding: 40px;
+  }
+  .lightbox.on { display: flex; }
+  .lightbox img { max-width: 90%; max-height: 90vh; box-shadow: 0 0 0 12px #1a1208, 0 0 0 14px var(--gold); }
+  .lightbox-close {
+    position: absolute; top: 24px; right: 28px;
+    font-family: 'Cormorant Garamond', serif; font-size: 24px;
+    color: var(--ink); cursor: pointer; background: transparent; border: 0;
+  }
+
+  /* 错误占位 */
+  .error-veil {
+    min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; padding: 40px; text-align: center;
+  }
+  .error-veil h2 { font-family: 'Cormorant Garamond', serif; font-style: italic; font-weight: 300; font-size: 32px; }
+  .error-veil p { color: var(--ink-soft); margin: 12px 0 32px; }
+  .error-veil a { color: var(--gold); border-bottom: 1px solid var(--gold); padding-bottom: 4px; font-size: 11px; letter-spacing: 0.3em; text-transform: uppercase; }
 </style>
 </head>
 <body>
 
-<div id="ui-overlay">
-  <header id="top-bar">
-    <a href="/"><i>←</i> Back</a>
-    <div id="status"><span class="dot"></span><span id="statusText">Searching for ARise marker…</span></div>
-    <span style="width:40px"></span>
-  </header>
-
-  <div id="scanFrame"><span></span></div>
-
-  <div id="hint">
-    <h3 id="hintTitle">Point at your Echo Card</h3>
-    <p id="hintText">将摄像头对准卡片正面的 ARise 标识</p>
-  </div>
+<div class="curtain" id="curtain">
+  <div class="curtain-text">A light is descending —</div>
 </div>
 
-<a-scene
-  embedded
-  vr-mode-ui="enabled: false"
-  arjs="sourceType: webcam; debugUIEnabled: false; detectionMode: mono_and_matrix; matrixCodeType: 3x3;"
-  renderer="logarithmicDepthBuffer: true; precision: medium; antialias: true; alpha: true"
-  loading-screen="enabled: false"
->
-  <a-assets>
-    <img id="placeholder-art" crossorigin="anonymous"
-      src="data:image/svg+xml;base64,${btoa('<svg xmlns="http://www.w3.org/2000/svg" width="512" height="700" viewBox="0 0 512 700"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#6B46C1"/><stop offset="100%" stop-color="#9F7AEA"/></linearGradient></defs><rect width="512" height="700" rx="24" fill="url(#g)"/><text x="256" y="350" font-family="serif" font-size="36" font-style="italic" fill="white" text-anchor="middle" opacity="0.9">Your Echo</text><text x="256" y="400" font-family="sans-serif" font-size="18" fill="white" text-anchor="middle" opacity="0.55">awaits</text></svg>')}" />
-  </a-assets>
+<div class="top-bar-g">
+  <a href="/">← ARise</a>
+  <span class="serif-italic" style="text-transform:none; letter-spacing:0.05em;">The Reveal</span>
+  <a href="/create">+ New Echo</a>
+</div>
 
-  <!-- Marker: 使用 AR.js 预设 hiro 占位,生产可换为 type='pattern' url='/static/arise.patt' -->
-  <a-marker preset="hiro" id="ariseMarker" emitevents="true">
-    <a-image
-      id="output-art"
-      src="#placeholder-art"
-      position="0 0.05 0"
-      rotation="-90 0 0"
-      width="1.4"
-      height="2"
-      opacity="0.95"
-      animation="property: position; to: 0 0.4 0; dur: 1200; easing: easeOutCubic"
-    ></a-image>
+<main class="gallery-room" id="room">
+  <div class="spot"></div>
+  <div class="dust" id="dust"></div>
+  <div class="floor"></div>
 
-    <a-text
-      id="echo-text"
-      value=""
-      align="center"
-      color="#FFFFFF"
-      width="2.4"
-      position="0 0.06 1.2"
-      rotation="-90 0 0"
-      font="https://cdn.aframe.io/fonts/Roboto-msdf.json"
-      negate="false"
-    ></a-text>
-  </a-marker>
+  <div class="stage" id="stage">
+    <div class="frame-wrap" id="frameWrap">
+      <div class="frame" id="frame">
+        <img id="artImg" alt="Echo"/>
+      </div>
+    </div>
 
-  <a-entity camera></a-entity>
-</a-scene>
+    <div class="plaque">
+      <div class="num" id="plaqueNum">№ —</div>
+      <h2 class="title" id="plaqueTitle">—</h2>
+      <p class="desc" id="plaqueDesc">—</p>
+      <div class="meta-row">
+        <div class="voice-l">Voice &nbsp; <b id="plaqueVoice">—</b></div>
+        <div class="voice-l"><span class="swatch-mini" id="plaqueSwatch"></span><span id="plaqueNote" class="serif-italic" style="text-transform:none; letter-spacing:0.04em; color:var(--ink-soft);">—</span></div>
+      </div>
+    </div>
+  </div>
+
+  <aside class="ticket" id="ticket">
+    <button class="close-x" id="ticketClose" aria-label="Close">×</button>
+    <div class="tnum">Admit one</div>
+    <div class="ttitle" id="ticketTitle">—</div>
+    <div class="tnote" id="ticketNote">—</div>
+    <div class="tactions">
+      <button id="copyBtn">Copy link</button>
+      <button id="newBtn">New echo</button>
+    </div>
+  </aside>
+</main>
+
+<div class="lightbox" id="lightbox">
+  <button class="lightbox-close" id="lightboxClose">close</button>
+  <img id="lightboxImg" alt="Echo full"/>
+</div>
 
 <script>
 (async () => {
-  const params = new URLSearchParams(location.search);
-  const echoId = params.get('id') || '${echoId}';
-  const statusText = document.getElementById('statusText');
-  const hintTitle = document.getElementById('hintTitle');
-  const hintText = document.getElementById('hintText');
-  const outputArt = document.getElementById('output-art');
-  const echoTextEl = document.getElementById('echo-text');
+  const $ = (id) => document.getElementById(id);
+  const id = ${JSON.stringify(id)};
+  const room = $('room');
+  const curtain = $('curtain');
 
-  // 1) 拉取 echo 内容
-  if (echoId) {
-    statusText.textContent = 'Loading echo ' + echoId + '…';
-    try {
-      const resp = await fetch('/api/echo/' + encodeURIComponent(echoId));
-      if (resp.ok) {
-        const data = await resp.json();
-        // 替换 a-image 的 src 为 AI 艺术图
-        outputArt.setAttribute('src', data.art);
-        echoTextEl.setAttribute('value', data.text);
-        statusText.textContent = 'Echo ready · point camera at marker';
-      } else {
-        statusText.textContent = 'Echo not found · using demo art';
-      }
-    } catch (e) {
-      statusText.textContent = 'Network error · using demo art';
-    }
-  } else {
-    statusText.textContent = 'Demo mode · point at marker';
+  // 粒子尘埃
+  const dust = $('dust');
+  for (let i = 0; i < 28; i++) {
+    const s = document.createElement('div');
+    s.className = 'speck';
+    s.style.left = Math.random() * 100 + '%';
+    s.style.top = (Math.random() * 50 + 70) + '%';
+    s.style.animationDelay = (Math.random() * 18) + 's';
+    s.style.animationDuration = (12 + Math.random() * 12) + 's';
+    s.style.opacity = (0.2 + Math.random() * 0.5).toFixed(2);
+    dust.appendChild(s);
   }
 
-  // 2) 监听 marker 出现/消失
-  const marker = document.getElementById('ariseMarker');
-  marker.addEventListener('markerFound', () => {
-    hintTitle.textContent = '✦ Memory revealed';
-    hintText.textContent = '保持卡片在画面中,慢慢移动观察';
-    document.getElementById('scanFrame').style.display = 'none';
-    statusText.textContent = 'Tracking · ARise marker locked';
+  // 取数据
+  let data = null;
+  try {
+    const r = await fetch('/api/echo/' + encodeURIComponent(id));
+    if (!r.ok) throw new Error('not found');
+    data = await r.json();
+  } catch (e) {
+    document.body.innerHTML = \`
+      <div class="error-veil">
+        <h2>This echo has dissolved.</h2>
+        <p>It may have expired, or the link may be incomplete.</p>
+        <a href="/create">Whisper a new one →</a>
+      </div>\`;
+    return;
+  }
+
+  // 注入内容
+  $('artImg').src = data.art;
+  $('plaqueNum').textContent = data.number;
+  $('plaqueTitle').innerHTML = data.title + ' &nbsp; <em>— an Echo</em>';
+  $('plaqueDesc').textContent = '"' + data.text + '"';
+  $('plaqueVoice').textContent = data.voiceLabel;
+  $('plaqueSwatch').style.background = data.palette;
+  $('plaqueSwatch').style.boxShadow = '0 0 8px ' + data.palette;
+  $('plaqueNote').textContent = data.curatorNote;
+
+  $('ticketTitle').textContent = data.title;
+  $('ticketNote').textContent = '— curator’s note: ' + data.curatorNote;
+
+  // 揭幕动画(等图片解码)
+  const img = $('artImg');
+  const reveal = () => { curtain.classList.add('lift'); room.classList.add('live'); };
+  if (img.complete) setTimeout(reveal, 900);
+  else { img.addEventListener('load', () => setTimeout(reveal, 900)); img.addEventListener('error', () => setTimeout(reveal, 900)); }
+
+  // 鼠标视差(只对画框)
+  const frameWrap = $('frameWrap');
+  const onMouse = (e) => {
+    const x = (e.clientX / window.innerWidth - 0.5) * 2;
+    const y = (e.clientY / window.innerHeight - 0.5) * 2;
+    frameWrap.style.transform = \`rotateY(\${x * 6}deg) rotateX(\${-y * 5}deg) translateZ(0)\`;
+  };
+  if (matchMedia('(pointer: fine)').matches) {
+    window.addEventListener('mousemove', onMouse);
+  }
+  // 移动端用陀螺仪(可选,不强制)
+  window.addEventListener('deviceorientation', (e) => {
+    if (!e.beta || !e.gamma) return;
+    const x = Math.max(-1, Math.min(1, e.gamma / 30));
+    const y = Math.max(-1, Math.min(1, (e.beta - 30) / 30));
+    frameWrap.style.transform = \`rotateY(\${x * 6}deg) rotateX(\${-y * 5}deg) translateZ(0)\`;
   });
-  marker.addEventListener('markerLost', () => {
-    hintTitle.textContent = 'Re-align the card';
-    hintText.textContent = '将摄像头重新对准 ARise 标识';
-    document.getElementById('scanFrame').style.display = 'block';
-    statusText.textContent = 'Searching for ARise marker…';
+
+  // Lightbox
+  const lightbox = $('lightbox');
+  $('frame').addEventListener('click', () => {
+    $('lightboxImg').src = data.art;
+    lightbox.classList.add('on');
+  });
+  $('lightboxClose').addEventListener('click', () => lightbox.classList.remove('on'));
+  lightbox.addEventListener('click', (e) => { if (e.target === lightbox) lightbox.classList.remove('on'); });
+
+  // Ticket
+  $('ticketClose').addEventListener('click', () => $('ticket').style.display = 'none');
+  $('newBtn').addEventListener('click', () => location.href = '/create');
+  $('copyBtn').addEventListener('click', async () => {
+    const url = location.origin + '/echo/' + id;
+    try {
+      await navigator.clipboard.writeText(url);
+      const b = $('copyBtn'); const old = b.textContent;
+      b.textContent = '✓ Copied'; b.classList.add('copied');
+      setTimeout(() => { b.textContent = old; b.classList.remove('copied'); }, 1800);
+    } catch (e) { prompt('Copy this link:', url); }
   });
 })();
 </script>
+
 </body>
 </html>`)
 })
 
-// Favicon: 内嵌紫色 ARise "A" SVG,避免 404
+// ===================================================================
+// /echo/:id  · 分享落地页(走入境光晕,然后跳画廊)
+// ===================================================================
+app.get('/echo/:id', (c) => {
+  const id = c.req.param('id')
+  return c.html(`<!DOCTYPE html>
+<html lang="en">
+<head>
+${sharedHead}
+<title>ARise · Someone left you an echo.</title>
+<meta http-equiv="refresh" content="3.5;url=/gallery/${id}">
+<style>
+  body { background: #050309; overflow: hidden; }
+  .arrival {
+    min-height: 100vh; min-height: 100dvh;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; padding: 40px 24px; position: relative;
+    background: radial-gradient(circle at 50% 50%, rgba(159,122,234,0.18) 0%, transparent 55%), #050309;
+  }
+  .halo-s {
+    position: absolute; inset: 0; pointer-events: none;
+    background: radial-gradient(circle at 50% 50%, rgba(212,175,122,0.1) 0%, transparent 35%);
+    animation: pulse 4s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:0.6} 50%{opacity:1} }
+  .arrival h1 {
+    font-family: 'Cormorant Garamond', serif; font-style: italic; font-weight: 300;
+    font-size: clamp(28px, 5vw, 42px);
+    margin: 0 0 22px; opacity: 0; animation: fade 1.2s 0.4s forwards;
+    max-width: 540px;
+  }
+  .arrival p {
+    color: var(--ink-soft); font-size: 13px; line-height: 1.8; max-width: 420px;
+    opacity: 0; animation: fade 1.2s 1.2s forwards; margin: 0 0 36px;
+  }
+  .arrival .label {
+    font-size: 10px; letter-spacing: 0.4em; text-transform: uppercase; color: var(--gold);
+    opacity: 0; animation: fade 1.2s 2s forwards;
+  }
+  @keyframes fade { to { opacity: 1; } }
+  .arrival a { color: var(--gold); border-bottom: 1px solid var(--gold); padding-bottom: 2px; }
+</style>
+</head>
+<body>
+<section class="arrival">
+  <div class="halo-s"></div>
+  <h1>Someone left you an echo.</h1>
+  <p>Stand still for a moment.<br/>The wall is being lit on your behalf.</p>
+  <div class="label">Entering Gallery №<span style="color:var(--ink-soft);"> ${id}</span> …</div>
+  <p style="margin-top:48px; font-size:11px; opacity:0;animation:fade 1.2s 3s forwards;">
+    <a href="/gallery/${id}">enter now →</a>
+  </p>
+</section>
+</body>
+</html>`)
+})
+
+// ===================================================================
+// favicon + health
+// ===================================================================
 app.get('/favicon.ico', (c) => {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
     <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#6B46C1"/><stop offset="100%" stop-color="#9F7AEA"/>
+      <stop offset="0%" stop-color="#9F7AEA"/><stop offset="100%" stop-color="#D4AF7A"/>
     </linearGradient></defs>
-    <rect width="100" height="100" rx="22" fill="#0a0a0f"/>
+    <rect width="100" height="100" rx="22" fill="#050309"/>
     <path d="M50 18 L82 84 L68 84 L60 66 L40 66 L32 84 L18 84 Z M44 54 L56 54 L50 32 Z" fill="url(#g)"/>
   </svg>`
-  return new Response(svg, {
-    headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' }
-  })
+  return new Response(svg, { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' } })
 })
 
-// 健康检查
 app.get('/api/health', (c) => c.json({
   ok: true,
-  service: 'ARise EchoCards',
+  service: 'ARise · Echo Gallery',
   hf_configured: !!c.env.HF_TOKEN,
-  storage: c.env.ECHO_KV ? 'kv' : 'memory'
+  storage: c.env.ECHO_KV ? 'kv' : 'memory',
 }))
 
 export default app
