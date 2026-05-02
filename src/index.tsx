@@ -89,34 +89,47 @@ app.post('/api/generate', async (c) => {
     if (!memoryText) return c.json({ error: 'Whisper cannot be empty' }, 400)
 
     const voice = VOICES[voiceKey]
-    const HF_TOKEN = c.env.HF_TOKEN || ''
 
     const artPrompt = `${voice.prompt}, inspired by the memory: "${memoryText}", abstract figurative art, double exposure, museum-quality fine art, painterly, no human faces, no text, no letters, no signature, vertical composition, evocative atmosphere, masterful composition`
 
     let base64Image: string
 
-    if (HF_TOKEN) {
-      const hfResponse = await fetch(
-        'https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell',
-        {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${HF_TOKEN}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            inputs: artPrompt,
-            parameters: { num_inference_steps: 4, guidance_scale: 0.0, width: 768, height: 1024 },
-          }),
+    // ============================================================
+    // Pollinations.ai —— 完全免费、无需 token、无需注册
+    // 直接 GET 请求 image.pollinations.ai/prompt/<encoded>?...
+    // 返回真正的 JPEG 图片
+    // ============================================================
+    try {
+      const seed = Math.floor(Math.random() * 1_000_000)
+      const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(artPrompt)}?width=768&height=1024&nologo=true&enhance=true&seed=${seed}&model=flux`
+
+      const resp = await fetch(url, {
+        method: 'GET',
+        headers: { 'Accept': 'image/jpeg,image/png,image/*' },
+      })
+
+      if (!resp.ok) {
+        console.warn('[Pollinations] non-OK:', resp.status)
+        // 失败就回退占位艺术,流程不中断
+        base64Image = makePlaceholderArt(voice.palette, voiceKey)
+      } else {
+        const ct = resp.headers.get('content-type') || 'image/jpeg'
+        const arrayBuffer = await resp.arrayBuffer()
+        const bytes = new Uint8Array(arrayBuffer)
+        // 兜底:返回的不是图,也回退占位
+        if (bytes.length < 1024) {
+          base64Image = makePlaceholderArt(voice.palette, voiceKey)
+        } else {
+          let binary = ''
+          const CHUNK = 0x8000
+          for (let i = 0; i < bytes.length; i += CHUNK) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as any)
+          }
+          base64Image = `data:${ct};base64,${btoa(binary)}`
         }
-      )
-      if (!hfResponse.ok) {
-        const errText = await hfResponse.text()
-        return c.json({ error: 'AI service unavailable', detail: errText, hint: 'Cold start may take ~20s. Retry once.' }, 502)
       }
-      const arrayBuffer = await hfResponse.arrayBuffer()
-      const bytes = new Uint8Array(arrayBuffer)
-      let binary = ''
-      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
-      base64Image = `data:image/png;base64,${btoa(binary)}`
-    } else {
+    } catch (e) {
+      console.warn('[Pollinations] fetch error:', e)
       base64Image = makePlaceholderArt(voice.palette, voiceKey)
     }
 
@@ -1253,7 +1266,7 @@ app.get('/favicon.ico', (c) => {
 app.get('/api/health', (c) => c.json({
   ok: true,
   service: 'ARise · Echo Gallery',
-  hf_configured: !!c.env.HF_TOKEN,
+  ai_provider: 'pollinations.ai (free, no token)',
   storage: c.env.ECHO_KV ? 'kv' : 'memory',
 }))
 
