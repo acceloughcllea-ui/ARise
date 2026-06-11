@@ -1,5 +1,7 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
+import { exhibitHtml } from './pages/exhibit'
+import { archiveHtml } from './pages/archive'
 
 type Bindings = {
   HF_TOKEN?: string
@@ -8,6 +10,16 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>()
 app.use('/api/*', cors())
+
+// ===================================================================
+// /exhibit  · Live Exhibit (从 arise-echo-gallery-7nz.pages.dev 复刻)
+// ===================================================================
+app.get('/exhibit', (c) => c.html(exhibitHtml))
+
+// ===================================================================
+// /archive  · The Archive (从 arise-echo-gallery-7nz.pages.dev 复刻)
+// ===================================================================
+app.get('/archive', (c) => c.html(archiveHtml))
 
 // ========== 内存兜底 ==========
 const memoryStore = new Map<string, EchoRecord>()
