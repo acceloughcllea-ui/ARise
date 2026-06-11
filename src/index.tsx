@@ -7,7 +7,8 @@ import { archiveHtml } from './pages/archive'
 type Bindings = {
   HF_TOKEN?: string
   ECHO_KV?: KVNamespace
-  AI?: any  // Cloudflare Workers AI binding (configured in wrangler.jsonc)
+  DB?: D1Database  // Cloudflare D1 database binding (arise-echo-db, configured in dashboard)
+  AI?: any         // Cloudflare Workers AI binding (configured in wrangler.jsonc)
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -33,6 +34,53 @@ type EchoRecord = {
   title: string       // generated poetic title
   curatorNote: string // generated curator's note
   createdAt: number
+}
+
+// ========== 存储层 (优先 D1, 退而求其次 KV, 最后内存) ==========
+async function ensureD1Schema(db: D1Database): Promise<void> {
+  // 幂等创建表; 不会破坏已有数据
+  try {
+    await db.exec("CREATE TABLE IF NOT EXISTS echoes (id TEXT PRIMARY KEY, art TEXT NOT NULL, text TEXT NOT NULL, voice TEXT NOT NULL, title TEXT NOT NULL, curatorNote TEXT NOT NULL, createdAt INTEGER NOT NULL)")
+  } catch (e) {
+    // 表已存在或者权限问题, 静默忽略
+  }
+}
+
+async function saveEcho(env: Bindings, id: string, record: EchoRecord): Promise<void> {
+  if (env.DB) {
+    try {
+      await ensureD1Schema(env.DB)
+      await env.DB.prepare(
+        "INSERT OR REPLACE INTO echoes (id, art, text, voice, title, curatorNote, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      ).bind(id, record.art, record.text, record.voice, record.title, record.curatorNote, record.createdAt).run()
+      return
+    } catch (e) {
+      console.warn('[D1 saveEcho] error:', (e as Error)?.message)
+      // fallthrough to KV/memory
+    }
+  }
+  if (env.ECHO_KV) {
+    await env.ECHO_KV.put(`echo:${id}`, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 })
+    return
+  }
+  memoryStore.set(id, record)
+}
+
+async function loadEcho(env: Bindings, id: string): Promise<EchoRecord | null> {
+  if (env.DB) {
+    try {
+      await ensureD1Schema(env.DB)
+      const row = await env.DB.prepare("SELECT art, text, voice, title, curatorNote, createdAt FROM echoes WHERE id = ?").bind(id).first<EchoRecord>()
+      if (row) return row
+    } catch (e) {
+      console.warn('[D1 loadEcho] error:', (e as Error)?.message)
+    }
+  }
+  if (env.ECHO_KV) {
+    const raw = await env.ECHO_KV.get(`echo:${id}`)
+    if (raw) return JSON.parse(raw) as EchoRecord
+  }
+  return memoryStore.get(id) || null
 }
 
 // ========== 风格定义 ==========
@@ -200,11 +248,7 @@ app.post('/api/generate', async (c) => {
       createdAt: Date.now(),
     }
 
-    if (c.env.ECHO_KV) {
-      await c.env.ECHO_KV.put(`echo:${id}`, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 })
-    } else {
-      memoryStore.set(id, record)
-    }
+    await saveEcho(c.env, id, record)
 
     return c.json({ id, ...record, number: formatEchoNumber(id, record.createdAt), voiceLabel: voice.label })
   } catch (e: any) {
@@ -264,23 +308,44 @@ function makePlaceholderArt(palette: string, voiceKey: string, seed: number = Da
 
 app.get('/api/echo/:id', async (c) => {
   const id = c.req.param('id')
-  let record: EchoRecord | null = null
-  if (c.env.ECHO_KV) {
-    const raw = await c.env.ECHO_KV.get(`echo:${id}`)
-    if (raw) record = JSON.parse(raw)
-  } else {
-    record = memoryStore.get(id) || null
-  }
+  const record = await loadEcho(c.env, id)
   if (!record) return c.json({ error: 'Not found' }, 404)
   const voice = VOICES[record.voice] || VOICES['velvet-midnight']
   return c.json({ id, ...record, number: formatEchoNumber(id, record.createdAt), voiceLabel: voice.label, palette: voice.palette })
 })
 
 // ========== 列表 API:供 /exhibit 与 /archive 取所有作品 ==========
-async function listAllEchoes(env: Bindings): Promise<Array<EchoRecord & { id: string; voiceLabel: string; palette: string; number: string }>> {
-  const items: Array<EchoRecord & { id: string; voiceLabel: string; palette: string; number: string }> = []
+type EchoListItem = EchoRecord & { id: string; voiceLabel: string; palette: string; number: string }
+
+function decorate(id: string, r: EchoRecord): EchoListItem {
+  const voice = VOICES[r.voice] || VOICES['velvet-midnight']
+  return {
+    ...r,
+    id,
+    voiceLabel: voice.label,
+    palette: voice.palette,
+    number: formatEchoNumber(id, r.createdAt),
+  }
+}
+
+async function listAllEchoes(env: Bindings): Promise<EchoListItem[]> {
+  // L1: D1
+  if (env.DB) {
+    try {
+      await ensureD1Schema(env.DB)
+      const { results } = await env.DB.prepare(
+        "SELECT id, art, text, voice, title, curatorNote, createdAt FROM echoes ORDER BY createdAt DESC LIMIT 1000"
+      ).all<{ id: string } & EchoRecord>()
+      if (results && results.length > 0) {
+        return results.map(r => decorate(r.id, r))
+      }
+    } catch (e) {
+      console.warn('[D1 listAll] error:', (e as Error)?.message)
+    }
+  }
+  // L2: KV
+  const items: EchoListItem[] = []
   if (env.ECHO_KV) {
-    // 列出 KV 中所有 echo:* 键
     const list = await env.ECHO_KV.list({ prefix: 'echo:', limit: 1000 })
     for (const k of list.keys) {
       const raw = await env.ECHO_KV.get(k.name)
@@ -288,29 +353,15 @@ async function listAllEchoes(env: Bindings): Promise<Array<EchoRecord & { id: st
       try {
         const r: EchoRecord = JSON.parse(raw)
         const id = k.name.replace(/^echo:/, '')
-        const voice = VOICES[r.voice] || VOICES['velvet-midnight']
-        items.push({
-          ...r,
-          id,
-          voiceLabel: voice.label,
-          palette: voice.palette,
-          number: formatEchoNumber(id, r.createdAt),
-        })
+        items.push(decorate(id, r))
       } catch {}
     }
   } else {
+    // L3: 内存
     for (const [id, r] of memoryStore.entries()) {
-      const voice = VOICES[r.voice] || VOICES['velvet-midnight']
-      items.push({
-        ...r,
-        id,
-        voiceLabel: voice.label,
-        palette: voice.palette,
-        number: formatEchoNumber(id, r.createdAt),
-      })
+      items.push(decorate(id, r))
     }
   }
-  // 按创建时间倒序 (最新在前)
   items.sort((a, b) => b.createdAt - a.createdAt)
   return items
 }
@@ -1195,8 +1246,10 @@ app.get('/favicon.ico', (c) => {
 app.get('/api/health', (c) => c.json({
   ok: true,
   service: 'ARise · Echo Gallery',
-  ai_provider: 'pollinations.ai (free, no token)',
-  storage: c.env.ECHO_KV ? 'kv' : 'memory',
+  ai_provider: c.env.AI ? 'cloudflare-workers-ai (flux-1-schnell, free)' : 'pollinations + svg fallback',
+  ai_binding: !!c.env.AI,
+  storage: c.env.DB ? 'd1' : (c.env.ECHO_KV ? 'kv' : 'memory'),
+  version: 'v3-d1-cf-ai',
 }))
 
 export default app
