@@ -269,10 +269,11 @@ async function generateViaHorde(prompt: string, seed: number): Promise<string> {
     body: JSON.stringify({
       prompt,
       params: {
+        // 必须 ≤ 616x616 (匿名/低 kudos 用户的硬限制), 且 step ≤ 50
         sampler_name: 'k_euler_a',
         width: 512,
-        height: 768,
-        steps: 20,
+        height: 512,
+        steps: 18,
         cfg_scale: 7,
         seed: String(seed),
         n: 1,
