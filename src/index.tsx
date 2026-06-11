@@ -37,12 +37,63 @@ type EchoRecord = {
 }
 
 // ========== 存储层 (优先 D1, 退而求其次 KV, 最后内存) ==========
+// 用一个模块级标记避免每次请求都跑迁移
+let d1SchemaReady = false
+
 async function ensureD1Schema(db: D1Database): Promise<void> {
-  // 幂等创建表; 不会破坏已有数据
+  if (d1SchemaReady) return
+  // 1) 先尝试创建新表 (幂等; 如果表已存在, CREATE TABLE IF NOT EXISTS 不做任何事)
   try {
     await db.exec("CREATE TABLE IF NOT EXISTS echoes (id TEXT PRIMARY KEY, art TEXT NOT NULL, text TEXT NOT NULL, voice TEXT NOT NULL, title TEXT NOT NULL, curatorNote TEXT NOT NULL, createdAt INTEGER NOT NULL)")
   } catch (e) {
-    // 表已存在或者权限问题, 静默忽略
+    console.warn('[D1 schema] create table error:', (e as Error)?.message)
+  }
+  // 2) 探测列, 如果旧表少列 -> ALTER TABLE 补齐 (D1/SQLite 不支持改列名, 但支持 ADD COLUMN)
+  try {
+    const info = await db.prepare("PRAGMA table_info(echoes)").all<{name: string; type: string}>()
+    const cols = new Set((info.results ?? []).map(r => (r as any).name))
+    const required: Array<[string, string]> = [
+      ['id', 'TEXT'],
+      ['art', 'TEXT'],
+      ['text', 'TEXT'],
+      ['voice', 'TEXT'],
+      ['title', 'TEXT'],
+      ['curatorNote', 'TEXT'],
+      ['createdAt', 'INTEGER'],
+    ]
+    for (const [name, type] of required) {
+      if (!cols.has(name)) {
+        try {
+          await db.exec(`ALTER TABLE echoes ADD COLUMN ${name} ${type}`)
+          console.log(`[D1 schema] added missing column: ${name} ${type}`)
+        } catch (e2) {
+          console.warn(`[D1 schema] failed to add ${name}:`, (e2 as Error)?.message)
+        }
+      }
+    }
+    // 3) 数据迁移: 如果存在旧列名 (snake_case), 把数据复制到驼峰列
+    if (cols.has('created_at') && cols.has('createdAt')) {
+      try {
+        await db.exec("UPDATE echoes SET createdAt = created_at WHERE createdAt IS NULL AND created_at IS NOT NULL")
+      } catch {}
+    }
+    if (cols.has('curator_note') && cols.has('curatorNote')) {
+      try {
+        await db.exec("UPDATE echoes SET curatorNote = curator_note WHERE curatorNote IS NULL AND curator_note IS NOT NULL")
+      } catch {}
+    }
+    // 4) 兜底: 任何 NULL 的关键列填默认值, 避免后续读到 null 渲染崩
+    try {
+      await db.exec("UPDATE echoes SET createdAt = COALESCE(createdAt, 0) WHERE createdAt IS NULL")
+      await db.exec("UPDATE echoes SET title = COALESCE(title, 'Untitled') WHERE title IS NULL")
+      await db.exec("UPDATE echoes SET curatorNote = COALESCE(curatorNote, '') WHERE curatorNote IS NULL")
+      await db.exec("UPDATE echoes SET voice = COALESCE(voice, 'velvet-midnight') WHERE voice IS NULL")
+      await db.exec("UPDATE echoes SET art = COALESCE(art, '') WHERE art IS NULL")
+      await db.exec("UPDATE echoes SET text = COALESCE(text, '') WHERE text IS NULL")
+    } catch {}
+    d1SchemaReady = true
+  } catch (e) {
+    console.warn('[D1 schema] migration error:', (e as Error)?.message)
   }
 }
 
@@ -1484,7 +1535,7 @@ app.get('/api/health', (c) => c.json({
   version: 'v6-curate-fullscreen-artistry',
 }))
 
-// 诊断端点: 测试 D1 真实读写状态
+// 诊断端点: 测试 D1 真实读写状态 + 自动迁移
 app.get('/api/diag/db', async (c) => {
   const out: any = {
     bindings: {
@@ -1496,24 +1547,56 @@ app.get('/api/diag/db', async (c) => {
     memoryStore_keys: Array.from(memoryStore.keys()).slice(0, 5),
   }
   if (c.env.DB) {
+    // 强制重跑迁移
+    if (new URL(c.req.url).searchParams.get('migrate') === 'force') {
+      d1SchemaReady = false
+    }
+    // 0) 直接读 schema (不依赖 ensureD1Schema 是否成功)
+    try {
+      const info = await c.env.DB.prepare("PRAGMA table_info(echoes)").all()
+      out.d1_schema_before = (info.results ?? []).map((r: any) => `${r.name}:${r.type}`)
+    } catch (e: any) {
+      out.d1_schema_before_error = e?.message || String(e)
+    }
+    // 1) 跑迁移
     try {
       await ensureD1Schema(c.env.DB)
+      out.d1_schema_ready = d1SchemaReady
+    } catch (e: any) {
+      out.d1_schema_migration_error = e?.message || String(e)
+    }
+    // 2) 再读一次 schema
+    try {
+      const info = await c.env.DB.prepare("PRAGMA table_info(echoes)").all()
+      out.d1_schema_after = (info.results ?? []).map((r: any) => `${r.name}:${r.type}`)
+    } catch {}
+    // 3) 计数
+    try {
       const cnt = await c.env.DB.prepare("SELECT COUNT(*) as n FROM echoes").first<{n: number}>()
       out.d1_count = cnt?.n ?? null
+    } catch (e: any) {
+      out.d1_count_error = e?.message || String(e)
+    }
+    // 4) 取最近 5 条 (使用 createdAt 排序)
+    try {
       const sample = await c.env.DB.prepare("SELECT id, title, voice, createdAt FROM echoes ORDER BY createdAt DESC LIMIT 5").all()
       out.d1_recent = sample.results ?? []
-      // 写测试: 写一条 ephemeral 标记后再读
+    } catch (e: any) {
+      out.d1_recent_error = e?.message || String(e)
+    }
+    // 5) 活体写读删测试
+    try {
       const probeId = 'probe-' + Date.now().toString(36)
       await c.env.DB.prepare("INSERT INTO echoes (id, art, text, voice, title, curatorNote, createdAt) VALUES (?,?,?,?,?,?,?)")
         .bind(probeId, 'data:image/svg+xml,probe', 'probe', 'velvet-midnight', 'probe', 'probe', Date.now()).run()
       const verify = await c.env.DB.prepare("SELECT id FROM echoes WHERE id = ?").bind(probeId).first()
       out.d1_write_test = { id: probeId, readback_ok: !!verify }
-      // 立刻删掉测试记录
       await c.env.DB.prepare("DELETE FROM echoes WHERE id = ?").bind(probeId).run()
     } catch (e: any) {
-      out.d1_error = e?.message || String(e)
+      out.d1_write_test_error = e?.message || String(e)
     }
   }
+  c.header('Cache-Control', 'no-store, no-cache, must-revalidate')
   return c.json(out)
 })
 
