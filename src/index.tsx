@@ -42,58 +42,69 @@ let d1SchemaReady = false
 
 async function ensureD1Schema(db: D1Database): Promise<void> {
   if (d1SchemaReady) return
-  // 1) 先尝试创建新表 (幂等; 如果表已存在, CREATE TABLE IF NOT EXISTS 不做任何事)
   try {
-    await db.exec("CREATE TABLE IF NOT EXISTS echoes (id TEXT PRIMARY KEY, art TEXT NOT NULL, text TEXT NOT NULL, voice TEXT NOT NULL, title TEXT NOT NULL, curatorNote TEXT NOT NULL, createdAt INTEGER NOT NULL)")
-  } catch (e) {
-    console.warn('[D1 schema] create table error:', (e as Error)?.message)
-  }
-  // 2) 探测列, 如果旧表少列 -> ALTER TABLE 补齐 (D1/SQLite 不支持改列名, 但支持 ADD COLUMN)
-  try {
-    const info = await db.prepare("PRAGMA table_info(echoes)").all<{name: string; type: string}>()
-    const cols = new Set((info.results ?? []).map(r => (r as any).name))
-    const required: Array<[string, string]> = [
-      ['id', 'TEXT'],
-      ['art', 'TEXT'],
-      ['text', 'TEXT'],
-      ['voice', 'TEXT'],
-      ['title', 'TEXT'],
-      ['curatorNote', 'TEXT'],
-      ['createdAt', 'INTEGER'],
+    // === Step 1: 读当前列 ===
+    const info = await db.prepare("PRAGMA table_info(echoes)").all()
+    const cols = new Set((info.results ?? []).map((r: any) => r.name as string))
+
+    // 表不存在 -> 直接建新表, 收工
+    if (cols.size === 0) {
+      await db.exec("CREATE TABLE echoes (id TEXT PRIMARY KEY, art TEXT NOT NULL, text TEXT NOT NULL, voice TEXT NOT NULL, title TEXT NOT NULL, curatorNote TEXT NOT NULL, createdAt INTEGER NOT NULL)")
+      d1SchemaReady = true
+      return
+    }
+
+    // === Step 2: 检查是否需要重建 ===
+    // 新 schema 期望的列集合
+    const targetCols = new Set(['id', 'art', 'text', 'voice', 'title', 'curatorNote', 'createdAt'])
+    // 如果列正好相等, 啥也不用做
+    const colArr = Array.from(cols)
+    const isExactMatch = colArr.length === targetCols.size && colArr.every(c => targetCols.has(c))
+    if (isExactMatch) {
+      d1SchemaReady = true
+      return
+    }
+
+    // 否则: 旧表 + 新列混在一起, 必须重建. 重建前先把所有数据搬到新表.
+    // 旧->新 字段映射
+    const pickExpr = (target: string, fallback1: string, fallback2: string, def: string): string => {
+      // 用 COALESCE 选第一个非 NULL: 优先新列, 否则旧列, 否则默认值
+      const candidates: string[] = []
+      if (cols.has(target)) candidates.push(target)
+      if (cols.has(fallback1)) candidates.push(fallback1)
+      if (cols.has(fallback2)) candidates.push(fallback2)
+      if (candidates.length === 0) return def
+      return `COALESCE(${candidates.join(', ')}, ${def})`
+    }
+    const selectId = cols.has('id') ? 'id' : "'unknown'"
+    const selectArt = pickExpr('art', 'art', 'art', "''")
+    const selectText = pickExpr('text', 'text', 'text', "''")
+    const selectVoice = pickExpr('voice', 'voice_key', 'voice', "'velvet-midnight'")
+    const selectTitle = pickExpr('title', 'title', 'title', "'Untitled'")
+    const selectNote = pickExpr('curatorNote', 'curator_note', 'curatorNote', "''")
+    const selectCreated = pickExpr('createdAt', 'created_at', 'createdAt', '0')
+
+    // 用事务式批量语句重建表
+    const stmts = [
+      "DROP TABLE IF EXISTS echoes_new",
+      "CREATE TABLE echoes_new (id TEXT PRIMARY KEY, art TEXT NOT NULL, text TEXT NOT NULL, voice TEXT NOT NULL, title TEXT NOT NULL, curatorNote TEXT NOT NULL, createdAt INTEGER NOT NULL)",
+      `INSERT INTO echoes_new (id, art, text, voice, title, curatorNote, createdAt) SELECT ${selectId}, ${selectArt}, ${selectText}, ${selectVoice}, ${selectTitle}, ${selectNote}, ${selectCreated} FROM echoes`,
+      "DROP TABLE echoes",
+      "ALTER TABLE echoes_new RENAME TO echoes",
     ]
-    for (const [name, type] of required) {
-      if (!cols.has(name)) {
-        try {
-          await db.exec(`ALTER TABLE echoes ADD COLUMN ${name} ${type}`)
-          console.log(`[D1 schema] added missing column: ${name} ${type}`)
-        } catch (e2) {
-          console.warn(`[D1 schema] failed to add ${name}:`, (e2 as Error)?.message)
-        }
+    for (const sql of stmts) {
+      try {
+        await db.exec(sql)
+      } catch (e) {
+        console.warn('[D1 migrate] step failed:', sql.slice(0, 60), (e as Error)?.message)
+        // 即使中间步骤失败, 也不要把 d1SchemaReady 设为 true; 下次请求会再试一遍
+        return
       }
     }
-    // 3) 数据迁移: 如果存在旧列名 (snake_case), 把数据复制到驼峰列
-    if (cols.has('created_at') && cols.has('createdAt')) {
-      try {
-        await db.exec("UPDATE echoes SET createdAt = created_at WHERE createdAt IS NULL AND created_at IS NOT NULL")
-      } catch {}
-    }
-    if (cols.has('curator_note') && cols.has('curatorNote')) {
-      try {
-        await db.exec("UPDATE echoes SET curatorNote = curator_note WHERE curatorNote IS NULL AND curator_note IS NOT NULL")
-      } catch {}
-    }
-    // 4) 兜底: 任何 NULL 的关键列填默认值, 避免后续读到 null 渲染崩
-    try {
-      await db.exec("UPDATE echoes SET createdAt = COALESCE(createdAt, 0) WHERE createdAt IS NULL")
-      await db.exec("UPDATE echoes SET title = COALESCE(title, 'Untitled') WHERE title IS NULL")
-      await db.exec("UPDATE echoes SET curatorNote = COALESCE(curatorNote, '') WHERE curatorNote IS NULL")
-      await db.exec("UPDATE echoes SET voice = COALESCE(voice, 'velvet-midnight') WHERE voice IS NULL")
-      await db.exec("UPDATE echoes SET art = COALESCE(art, '') WHERE art IS NULL")
-      await db.exec("UPDATE echoes SET text = COALESCE(text, '') WHERE text IS NULL")
-    } catch {}
     d1SchemaReady = true
+    console.log('[D1 schema] migration complete, table rebuilt')
   } catch (e) {
-    console.warn('[D1 schema] migration error:', (e as Error)?.message)
+    console.warn('[D1 schema] outer error:', (e as Error)?.message)
   }
 }
 
@@ -1532,7 +1543,7 @@ app.get('/api/health', (c) => c.json({
   ai_provider: 'cf-workers-ai (primary) → ai-horde (fallback) → svg',
   ai_binding: !!c.env.AI,
   storage: c.env.DB ? 'd1' : (c.env.ECHO_KV ? 'kv' : 'memory'),
-  version: 'v6-curate-fullscreen-artistry',
+  version: 'v6.3-rebuild-schema',
 }))
 
 // 诊断端点: 测试 D1 真实读写状态 + 自动迁移
