@@ -46,37 +46,33 @@ async function ensureD1Schema(db: D1Database): Promise<void> {
   }
 }
 
-async function saveEcho(env: Bindings, id: string, record: EchoRecord): Promise<void> {
-  let d1ok = false
+async function saveEcho(env: Bindings, id: string, record: EchoRecord): Promise<{d1: string; kv: string; mem: boolean}> {
+  const status = { d1: 'no-binding', kv: 'no-binding', mem: false }
   if (env.DB) {
     try {
       await ensureD1Schema(env.DB)
       await env.DB.prepare(
         "INSERT OR REPLACE INTO echoes (id, art, text, voice, title, curatorNote, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)"
       ).bind(id, record.art, record.text, record.voice, record.title, record.curatorNote, record.createdAt).run()
-      // 写后读回, 确认 D1 commit 真的完成 (修复"只显示最新一条"的根因)
       const verify = await env.DB.prepare("SELECT id FROM echoes WHERE id = ?").bind(id).first()
-      if (verify) {
-        d1ok = true
-      } else {
-        console.warn('[D1 saveEcho] write succeeded but read-back returned null, id=', id)
-      }
+      status.d1 = verify ? 'ok' : 'wrote-but-readback-null'
     } catch (e) {
+      status.d1 = 'error: ' + ((e as Error)?.message || String(e)).slice(0, 200)
       console.warn('[D1 saveEcho] error:', (e as Error)?.message)
     }
   }
-  // 双写: D1 即使成功也同时写 KV/memory 一份作为兜底, 避免 D1 边缘节点同步延迟导致列表读不到
   if (env.ECHO_KV) {
     try {
       await env.ECHO_KV.put(`echo:${id}`, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 90 })
+      status.kv = 'ok'
     } catch (e) {
+      status.kv = 'error: ' + ((e as Error)?.message || String(e)).slice(0, 200)
       console.warn('[KV saveEcho] error:', (e as Error)?.message)
     }
   }
   memoryStore.set(id, record)
-  if (!d1ok && !env.ECHO_KV) {
-    console.warn('[saveEcho] persisted only in memory (will not survive worker restart)')
-  }
+  status.mem = true
+  return status
 }
 
 async function loadEcho(env: Bindings, id: string): Promise<EchoRecord | null> {
@@ -289,7 +285,8 @@ app.post('/api/generate', async (c) => {
       createdAt: Date.now(),
     }
 
-    await saveEcho(c.env, id, record)
+    const storageStatus = await saveEcho(c.env, id, record)
+    debug.push(`storage: d1=${storageStatus.d1} kv=${storageStatus.kv} mem=${storageStatus.mem}`)
 
     c.header('X-AI-Provider', providerUsed)
     c.header('X-AI-Debug', debug.join(' | ').slice(0, 500))
@@ -300,6 +297,7 @@ app.post('/api/generate', async (c) => {
       voiceLabel: voice.label,
       _provider: providerUsed,
       _debug: debug,
+      _storage: storageStatus,
     })
   } catch (e: any) {
     return c.json({ error: e?.message || 'Internal error' }, 500)
@@ -1485,6 +1483,39 @@ app.get('/api/health', (c) => c.json({
   storage: c.env.DB ? 'd1' : (c.env.ECHO_KV ? 'kv' : 'memory'),
   version: 'v6-curate-fullscreen-artistry',
 }))
+
+// 诊断端点: 测试 D1 真实读写状态
+app.get('/api/diag/db', async (c) => {
+  const out: any = {
+    bindings: {
+      DB: !!c.env.DB,
+      ECHO_KV: !!c.env.ECHO_KV,
+      AI: !!c.env.AI,
+    },
+    memoryStore_size: memoryStore.size,
+    memoryStore_keys: Array.from(memoryStore.keys()).slice(0, 5),
+  }
+  if (c.env.DB) {
+    try {
+      await ensureD1Schema(c.env.DB)
+      const cnt = await c.env.DB.prepare("SELECT COUNT(*) as n FROM echoes").first<{n: number}>()
+      out.d1_count = cnt?.n ?? null
+      const sample = await c.env.DB.prepare("SELECT id, title, voice, createdAt FROM echoes ORDER BY createdAt DESC LIMIT 5").all()
+      out.d1_recent = sample.results ?? []
+      // 写测试: 写一条 ephemeral 标记后再读
+      const probeId = 'probe-' + Date.now().toString(36)
+      await c.env.DB.prepare("INSERT INTO echoes (id, art, text, voice, title, curatorNote, createdAt) VALUES (?,?,?,?,?,?,?)")
+        .bind(probeId, 'data:image/svg+xml,probe', 'probe', 'velvet-midnight', 'probe', 'probe', Date.now()).run()
+      const verify = await c.env.DB.prepare("SELECT id FROM echoes WHERE id = ?").bind(probeId).first()
+      out.d1_write_test = { id: probeId, readback_ok: !!verify }
+      // 立刻删掉测试记录
+      await c.env.DB.prepare("DELETE FROM echoes WHERE id = ?").bind(probeId).run()
+    } catch (e: any) {
+      out.d1_error = e?.message || String(e)
+    }
+  }
+  return c.json(out)
+})
 
 // 诊断端点: 测试 AI binding 是否真的能出图, 不写库
 app.get('/api/diag/ai', async (c) => {
