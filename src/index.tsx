@@ -7,6 +7,7 @@ import { archiveHtml } from './pages/archive'
 type Bindings = {
   HF_TOKEN?: string
   ECHO_KV?: KVNamespace
+  AI?: any  // Cloudflare Workers AI binding (configured in wrangler.jsonc)
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -105,46 +106,89 @@ app.post('/api/generate', async (c) => {
 
     const artPrompt = `${voice.prompt}, inspired by the memory: "${memoryText}", abstract figurative art, double exposure, museum-quality fine art, painterly, no human faces, no text, no letters, no signature, vertical composition, evocative atmosphere, masterful composition`
 
-    let base64Image: string
+    const seed = Math.floor(Math.random() * 1_000_000_000)
+    let base64Image: string = ''
+    let providerUsed = 'placeholder'
 
     // ============================================================
-    // Pollinations.ai —— 完全免费、无需 token、无需注册
-    // 直接 GET 请求 image.pollinations.ai/prompt/<encoded>?...
-    // 返回真正的 JPEG 图片
+    // L1 主力:Cloudflare Workers AI (Flux.1-schnell)
+    //   - 项目内直接 binding 调用,无需外部网络/token
+    //   - 在 Cloudflare 边缘运行,对所有用户并发友好
+    //   - 每天 10000 次免费推理
     // ============================================================
-    try {
-      const seed = Math.floor(Math.random() * 1_000_000)
-      const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(artPrompt)}?width=768&height=1024&nologo=true&enhance=true&seed=${seed}&model=flux`
-
-      const resp = await fetch(url, {
-        method: 'GET',
-        headers: { 'Accept': 'image/jpeg,image/png,image/*' },
-      })
-
-      if (!resp.ok) {
-        console.warn('[Pollinations] non-OK:', resp.status)
-        // 失败就回退占位艺术,流程不中断
-        base64Image = makePlaceholderArt(voice.palette, voiceKey)
-      } else {
-        const ct = resp.headers.get('content-type') || 'image/jpeg'
-        const arrayBuffer = await resp.arrayBuffer()
-        const bytes = new Uint8Array(arrayBuffer)
-        // 兜底:返回的不是图,也回退占位
-        if (bytes.length < 1024) {
-          base64Image = makePlaceholderArt(voice.palette, voiceKey)
-        } else {
-          let binary = ''
-          const CHUNK = 0x8000
-          for (let i = 0; i < bytes.length; i += CHUNK) {
-            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as any)
+    if (c.env.AI && !base64Image) {
+      try {
+        const aiResp: any = await c.env.AI.run('@cf/black-forest-labs/flux-1-schnell', {
+          prompt: artPrompt,
+          steps: 6,           // schnell 模型 4-8 步够用
+          seed,
+        })
+        // Workers AI 返回 { image: <base64-string> } 或直接二进制 ReadableStream
+        if (aiResp && typeof aiResp.image === 'string' && aiResp.image.length > 1000) {
+          base64Image = `data:image/jpeg;base64,${aiResp.image}`
+          providerUsed = 'cf-workers-ai'
+        } else if (aiResp instanceof Uint8Array || aiResp instanceof ArrayBuffer) {
+          const bytes = aiResp instanceof Uint8Array ? aiResp : new Uint8Array(aiResp)
+          if (bytes.length > 1024) {
+            let binary = ''
+            const CHUNK = 0x8000
+            for (let i = 0; i < bytes.length; i += CHUNK) {
+              binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as any)
+            }
+            base64Image = `data:image/jpeg;base64,${btoa(binary)}`
+            providerUsed = 'cf-workers-ai'
           }
-          base64Image = `data:${ct};base64,${btoa(binary)}`
         }
+      } catch (e) {
+        console.warn('[CF Workers AI] error:', (e as Error)?.message)
       }
-    } catch (e) {
-      console.warn('[Pollinations] fetch error:', e)
-      base64Image = makePlaceholderArt(voice.palette, voiceKey)
     }
+
+    // ============================================================
+    // L2 兜底:Pollinations.ai
+    //   - 不稳定 (经常 402 限流), 但有时能拿到真图
+    //   - 仅在 L1 失败时尝试
+    // ============================================================
+    if (!base64Image) {
+      try {
+        const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(artPrompt)}?width=768&height=1024&nologo=true&private=true&nofeed=true&seed=${seed}&model=flux`
+        const resp = await fetch(url, {
+          method: 'GET',
+          headers: {
+            'Accept': 'image/jpeg,image/png,image/*',
+            'Referer': 'https://pollinations.ai/',
+            'User-Agent': 'Mozilla/5.0 (compatible; ARiseGallery/1.0)',
+          },
+        })
+        if (resp.ok && (resp.headers.get('content-type') || '').startsWith('image/')) {
+          const ct = resp.headers.get('content-type') || 'image/jpeg'
+          const arrayBuffer = await resp.arrayBuffer()
+          const bytes = new Uint8Array(arrayBuffer)
+          if (bytes.length > 1024) {
+            let binary = ''
+            const CHUNK = 0x8000
+            for (let i = 0; i < bytes.length; i += CHUNK) {
+              binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as any)
+            }
+            base64Image = `data:${ct};base64,${btoa(binary)}`
+            providerUsed = 'pollinations'
+          }
+        } else {
+          console.warn('[Pollinations] non-OK:', resp.status)
+        }
+      } catch (e) {
+        console.warn('[Pollinations] fetch error:', (e as Error)?.message)
+      }
+    }
+
+    // ============================================================
+    // L3 最后兜底:SVG 占位艺术 (按 seed 变化, 不再千篇一律)
+    // ============================================================
+    if (!base64Image) {
+      base64Image = makePlaceholderArt(voice.palette, voiceKey, seed)
+    }
+
+    console.log(`[generate] provider=${providerUsed} voice=${voiceKey} seed=${seed}`)
 
     const id = crypto.randomUUID().slice(0, 8)
     const record: EchoRecord = {
@@ -168,15 +212,52 @@ app.post('/api/generate', async (c) => {
   }
 })
 
-function makePlaceholderArt(palette: string, voiceKey: string): string {
-  // 给四种风格各一种独特的 SVG 占位艺术
-  const variants: Record<string, string> = {
-    'sun-bleached': `<defs><radialGradient id="g" cx="50%" cy="35%" r="70%"><stop offset="0%" stop-color="#F5DEB3"/><stop offset="50%" stop-color="${palette}"/><stop offset="100%" stop-color="#3a2818"/></radialGradient></defs><rect width="768" height="1024" fill="url(#g)"/><circle cx="384" cy="360" r="220" fill="#FFE9C4" opacity="0.18"/><circle cx="384" cy="360" r="140" fill="#FFE9C4" opacity="0.12"/>`,
-    'underwater': `<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a4d6b"/><stop offset="50%" stop-color="${palette}"/><stop offset="100%" stop-color="#0a1a2a"/></linearGradient></defs><rect width="768" height="1024" fill="url(#g)"/><path d="M 0 300 Q 200 250 400 320 T 800 300" stroke="#fff" stroke-width="1" fill="none" opacity="0.15"/><path d="M 0 500 Q 200 450 400 520 T 800 500" stroke="#fff" stroke-width="1" fill="none" opacity="0.12"/><path d="M 0 700 Q 200 650 400 720 T 800 700" stroke="#fff" stroke-width="1" fill="none" opacity="0.1"/>`,
-    'velvet-midnight': `<defs><radialGradient id="g" cx="50%" cy="40%" r="80%"><stop offset="0%" stop-color="#5a3a8a"/><stop offset="50%" stop-color="${palette}"/><stop offset="100%" stop-color="#0a0420"/></radialGradient></defs><rect width="768" height="1024" fill="url(#g)"/><g fill="#fff"><circle cx="120" cy="180" r="1.2" opacity="0.7"/><circle cx="280" cy="90" r="0.8" opacity="0.5"/><circle cx="480" cy="220" r="1" opacity="0.6"/><circle cx="620" cy="120" r="1.4" opacity="0.8"/><circle cx="180" cy="320" r="0.6" opacity="0.4"/><circle cx="540" cy="380" r="0.9" opacity="0.5"/><circle cx="700" cy="260" r="1" opacity="0.6"/><circle cx="80" cy="450" r="0.7" opacity="0.4"/></g>`,
-    'pressed-flower': `<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#e8d8c8"/><stop offset="100%" stop-color="${palette}"/></linearGradient></defs><rect width="768" height="1024" fill="url(#g)"/><g stroke="#7a5050" stroke-width="0.8" fill="none" opacity="0.35"><path d="M 384 700 Q 380 500 384 350"/><path d="M 384 450 Q 320 420 280 380"/><path d="M 384 480 Q 450 450 490 410"/><circle cx="280" cy="380" r="22" fill="#a06870" opacity="0.5"/><circle cx="490" cy="410" r="18" fill="#a06870" opacity="0.5"/><circle cx="384" cy="350" r="26" fill="#9a5060" opacity="0.55"/></g>`,
+// seed-based PRNG -> 让每次占位图也不一样,不再千篇一律
+function seededRandom(seed: number) {
+  let s = seed >>> 0
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0
+    return s / 0xFFFFFFFF
   }
-  const inner = variants[voiceKey] || variants['velvet-midnight']
+}
+
+function makePlaceholderArt(palette: string, voiceKey: string, seed: number = Date.now()): string {
+  const rand = seededRandom(seed)
+  // 给四种风格各一种独特的 SVG 占位艺术, 用 seed 让细节有差异
+  let inner = ''
+
+  if (voiceKey === 'sun-bleached') {
+    const cx = 320 + Math.floor(rand() * 128)
+    const cy = 280 + Math.floor(rand() * 160)
+    const r1 = 180 + Math.floor(rand() * 80)
+    inner = `<defs><radialGradient id="g" cx="${(cx/768*100).toFixed(1)}%" cy="${(cy/1024*100).toFixed(1)}%" r="70%"><stop offset="0%" stop-color="#F5DEB3"/><stop offset="50%" stop-color="${palette}"/><stop offset="100%" stop-color="#3a2818"/></radialGradient></defs><rect width="768" height="1024" fill="url(#g)"/><circle cx="${cx}" cy="${cy}" r="${r1}" fill="#FFE9C4" opacity="0.18"/><circle cx="${cx}" cy="${cy}" r="${r1*0.6|0}" fill="#FFE9C4" opacity="0.12"/>`
+  } else if (voiceKey === 'underwater') {
+    const waves = Array.from({length:5}, (_,i) => {
+      const y = 200 + i*150 + Math.floor(rand()*60)
+      const amp = 30 + Math.floor(rand()*40)
+      return `<path d="M 0 ${y} Q 200 ${y-amp} 400 ${y+amp/2} T 800 ${y}" stroke="#fff" stroke-width="1" fill="none" opacity="${(0.15-i*0.02).toFixed(2)}"/>`
+    }).join('')
+    inner = `<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a4d6b"/><stop offset="50%" stop-color="${palette}"/><stop offset="100%" stop-color="#0a1a2a"/></linearGradient></defs><rect width="768" height="1024" fill="url(#g)"/>${waves}`
+  } else if (voiceKey === 'pressed-flower') {
+    const flowers = Array.from({length: 3 + Math.floor(rand()*3)}, () => {
+      const cx = 100 + Math.floor(rand()*568)
+      const cy = 250 + Math.floor(rand()*500)
+      const r = 14 + Math.floor(rand()*20)
+      return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="#a06870" opacity="0.5"/>`
+    }).join('')
+    inner = `<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#e8d8c8"/><stop offset="100%" stop-color="${palette}"/></linearGradient></defs><rect width="768" height="1024" fill="url(#g)"/><g stroke="#7a5050" stroke-width="0.8" fill="none" opacity="0.35"><path d="M 384 700 Q 380 500 384 350"/><path d="M 384 450 Q 320 420 280 380"/><path d="M 384 480 Q 450 450 490 410"/>${flowers}</g>`
+  } else {
+    // velvet-midnight (默认)
+    const stars = Array.from({length: 30 + Math.floor(rand()*30)}, () => {
+      const cx = Math.floor(rand()*768)
+      const cy = Math.floor(rand()*1024)
+      const r = (0.4 + rand()*1.2).toFixed(2)
+      const op = (0.3 + rand()*0.6).toFixed(2)
+      return `<circle cx="${cx}" cy="${cy}" r="${r}" opacity="${op}"/>`
+    }).join('')
+    inner = `<defs><radialGradient id="g" cx="50%" cy="40%" r="80%"><stop offset="0%" stop-color="#5a3a8a"/><stop offset="50%" stop-color="${palette}"/><stop offset="100%" stop-color="#0a0420"/></radialGradient></defs><rect width="768" height="1024" fill="url(#g)"/><g fill="#fff">${stars}</g>`
+  }
+
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="768" height="1024" viewBox="0 0 768 1024">${inner}</svg>`
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
 }
@@ -193,6 +274,55 @@ app.get('/api/echo/:id', async (c) => {
   if (!record) return c.json({ error: 'Not found' }, 404)
   const voice = VOICES[record.voice] || VOICES['velvet-midnight']
   return c.json({ id, ...record, number: formatEchoNumber(id, record.createdAt), voiceLabel: voice.label, palette: voice.palette })
+})
+
+// ========== 列表 API:供 /exhibit 与 /archive 取所有作品 ==========
+async function listAllEchoes(env: Bindings): Promise<Array<EchoRecord & { id: string; voiceLabel: string; palette: string; number: string }>> {
+  const items: Array<EchoRecord & { id: string; voiceLabel: string; palette: string; number: string }> = []
+  if (env.ECHO_KV) {
+    // 列出 KV 中所有 echo:* 键
+    const list = await env.ECHO_KV.list({ prefix: 'echo:', limit: 1000 })
+    for (const k of list.keys) {
+      const raw = await env.ECHO_KV.get(k.name)
+      if (!raw) continue
+      try {
+        const r: EchoRecord = JSON.parse(raw)
+        const id = k.name.replace(/^echo:/, '')
+        const voice = VOICES[r.voice] || VOICES['velvet-midnight']
+        items.push({
+          ...r,
+          id,
+          voiceLabel: voice.label,
+          palette: voice.palette,
+          number: formatEchoNumber(id, r.createdAt),
+        })
+      } catch {}
+    }
+  } else {
+    for (const [id, r] of memoryStore.entries()) {
+      const voice = VOICES[r.voice] || VOICES['velvet-midnight']
+      items.push({
+        ...r,
+        id,
+        voiceLabel: voice.label,
+        palette: voice.palette,
+        number: formatEchoNumber(id, r.createdAt),
+      })
+    }
+  }
+  // 按创建时间倒序 (最新在前)
+  items.sort((a, b) => b.createdAt - a.createdAt)
+  return items
+}
+
+app.get('/api/exhibit', async (c) => {
+  const items = await listAllEchoes(c.env)
+  return c.json({ count: items.length, updatedAt: Date.now(), items })
+})
+
+app.get('/api/archive', async (c) => {
+  const items = await listAllEchoes(c.env)
+  return c.json({ count: items.length, items })
 })
 
 // ===================================================================
