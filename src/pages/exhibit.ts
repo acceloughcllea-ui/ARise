@@ -130,6 +130,65 @@ export const exhibitHtml = `<!DOCTYPE html>
     width: 100%; height: 100%; object-fit: cover; display: block;
   }
 
+  /* === 全屏按鈕 (每幅畫右上角) === */
+  .artframe .fs-btn {
+    position: absolute; top: 12px; right: 12px; z-index: 3;
+    width: 36px; height: 36px;
+    background: rgba(10,6,18,0.65); backdrop-filter: blur(6px);
+    border: 1px solid rgba(212,175,122,0.6); border-radius: 50%;
+    color: #f5ede0; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    opacity: 0; transform: scale(0.85);
+    transition: opacity .3s, transform .3s, background .25s, border-color .25s, color .25s;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .artframe:hover .fs-btn,
+  .artframe .fs-btn:focus { opacity: 1; transform: scale(1); }
+  .artframe .fs-btn:hover { background: rgba(212,175,122,0.9); color: #0a0612; border-color: #D4AF7A; }
+  .artframe .fs-btn svg { width: 16px; height: 16px; pointer-events:none; }
+  /* 觸控設備也可見, 不依賴 hover */
+  @media (hover: none) {
+    .artframe .fs-btn { opacity: 1; transform: scale(1); }
+  }
+
+  /* === Lightbox 單圖全屏蒙層 === */
+  .lightbox {
+    position: fixed; inset: 0; z-index: 9999;
+    background: rgba(5,3,9,0.96); backdrop-filter: blur(14px);
+    display: none; align-items: center; justify-content: center;
+    padding: 4vh 4vw; cursor: zoom-out;
+    animation: lbFade .35s ease both;
+  }
+  .lightbox.open { display: flex; }
+  @keyframes lbFade { from{opacity:0} to{opacity:1} }
+  .lightbox-inner {
+    position: relative; max-width: 100%; max-height: 100%;
+    display: flex; flex-direction: column; align-items: center; gap: 18px;
+    cursor: default;
+  }
+  .lightbox-inner img {
+    max-width: min(92vw, 1400px); max-height: 80vh; object-fit: contain;
+    box-shadow: 0 0 0 6px #1a1208, 0 0 0 8px #D4AF7A,
+                0 30px 100px rgba(0,0,0,0.85),
+                0 0 120px rgba(212,175,122,0.18);
+    user-select: none;
+  }
+  .lightbox-meta { text-align: center; color: #f5ede0; max-width: 760px; }
+  .lightbox-meta .num { color: var(--gold); font-size: 11px; letter-spacing: 0.32em; text-transform: uppercase; margin-bottom: 8px; }
+  .lightbox-meta .ttl { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: clamp(22px, 3.4vw, 36px); line-height: 1.2; }
+  .lightbox-meta .voice { margin-top: 10px; font-size: 11px; letter-spacing: 0.28em; text-transform: uppercase; color: rgba(245,237,224,0.55); }
+  .lightbox-meta .voice .dot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:8px; vertical-align: middle; box-shadow: 0 0 8px currentColor; }
+  .lightbox-close {
+    position: absolute; top: -52px; right: -4px;
+    width: 44px; height: 44px; border-radius: 50%;
+    background: transparent; border: 1px solid rgba(212,175,122,0.6); color: #f5ede0;
+    cursor: pointer; font-size: 22px; line-height: 1;
+    transition: background .25s, color .25s, border-color .25s;
+  }
+  .lightbox-close:hover { background: var(--gold); color: #0a0612; border-color: var(--gold); }
+  .lightbox-hint { position: absolute; bottom: 18px; left: 0; right: 0; text-align: center;
+    color: rgba(245,237,224,0.35); font-size: 10.5px; letter-spacing: 0.32em; text-transform: uppercase; }
+
   /* === 銘牌（畫框下方,字號放大,手機可讀） === */
   .nameplate {
     text-align: center;
@@ -299,6 +358,20 @@ export const exhibitHtml = `<!DOCTYPE html>
     <span class="meta">arise-echo-gallery.pages.dev<span class="div"></span>低語的回響</span>
   </div>
 
+  <!-- Lightbox 單圖全屏蒙層 -->
+  <div class="lightbox" id="lightbox" role="dialog" aria-modal="true">
+    <div class="lightbox-inner" id="lbInner">
+      <button class="lightbox-close" id="lbClose" aria-label="Close full screen">&times;</button>
+      <img id="lbImg" alt=""/>
+      <div class="lightbox-meta">
+        <div class="num" id="lbNum"></div>
+        <div class="ttl" id="lbTtl"></div>
+        <div class="voice" id="lbVoice"></div>
+      </div>
+      <div class="lightbox-hint">Press ESC or click anywhere outside the artwork to close</div>
+    </div>
+  </div>
+
 <script>
 (() => {
   // ===== 走馬燈引擎(弧形透視 / 中央聚焦 / 拖拽滾輪 / 慣性) =====
@@ -312,6 +385,42 @@ export const exhibitHtml = `<!DOCTYPE html>
   const emptyEl     = document.getElementById('emptyState');
   const cornerCount = document.getElementById('cornerCount');
   const stage       = document.querySelector('.stage');
+
+  // ===== Lightbox 單圖全屏 =====
+  const lightbox = document.getElementById('lightbox');
+  const lbInner  = document.getElementById('lbInner');
+  const lbImg    = document.getElementById('lbImg');
+  const lbNum    = document.getElementById('lbNum');
+  const lbTtl    = document.getElementById('lbTtl');
+  const lbVoice  = document.getElementById('lbVoice');
+  const lbClose  = document.getElementById('lbClose');
+
+  function openLightbox(item) {
+    lbImg.src = item.art;
+    lbImg.alt = item.title || '';
+    lbNum.textContent = item.number || '';
+    lbTtl.textContent = '"' + (item.title || '') + '"';
+    lbVoice.innerHTML = '<span class="dot" style="background:' + (item.palette||'#9F7AEA') +
+                       ';color:' + (item.palette||'#9F7AEA') + ';"></span>' + (item.voiceLabel || '');
+    lightbox.classList.add('open');
+    userActiveUntil = performance.now() + 999999999; // 暫停走馬燈
+    document.body.style.overflow = 'hidden';
+  }
+  function closeLightbox() {
+    lightbox.classList.remove('open');
+    lbImg.src = '';
+    userActiveUntil = 0;
+    document.body.style.overflow = '';
+  }
+  // 點背景關閉, 但點圖/卡片內容不關
+  lightbox.addEventListener('click', (e) => {
+    if (e.target === lightbox) closeLightbox();
+  });
+  // 阻止 inner 區點擊冒泡(以免 inner 內部點擊被視為點背景)
+  lbInner.addEventListener('click', (e) => { e.stopPropagation(); });
+  lbClose.addEventListener('click', closeLightbox);
+  // 暴露給 buildPiece 用
+  window.__openLightbox = openLightbox;
 
   let items       = [];
   let offset      = 0;          // 當前 X 偏移(像素,正向 = 向左移動)
@@ -339,6 +448,14 @@ export const exhibitHtml = `<!DOCTYPE html>
     el.style.setProperty('--glow', (item.palette || '#9F7AEA') + '55');
     el.innerHTML = \`
       <div class="artframe">
+        <button class="fs-btn" type="button" aria-label="View full screen" title="Full screen">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="4 9 4 4 9 4"></polyline>
+            <polyline points="15 4 20 4 20 9"></polyline>
+            <polyline points="4 15 4 20 9 20"></polyline>
+            <polyline points="15 20 20 20 20 15"></polyline>
+          </svg>
+        </button>
         <img src="\${escapeHTML(item.art)}" alt="\${escapeHTML(item.title)}" loading="eager" draggable="false"/>
       </div>
       <div class="nameplate">
@@ -347,6 +464,20 @@ export const exhibitHtml = `<!DOCTYPE html>
         <div class="voice"><span class="dot" style="background:\${item.palette};color:\${item.palette};"></span>\${escapeHTML(item.voiceLabel || '')}</div>
       </div>
     \`;
+    // 把 item 掛到節點上, 全屏按鈕的事件處理器讀取
+    el._item = item;
+    const fsBtn = el.querySelector('.fs-btn');
+    fsBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      ev.preventDefault();
+      openLightbox(item);
+    });
+    // 雙擊畫面也能全屏
+    const img = el.querySelector('img');
+    img.addEventListener('dblclick', (ev) => {
+      ev.stopPropagation();
+      openLightbox(item);
+    });
     return el;
   }
 
@@ -477,6 +608,12 @@ export const exhibitHtml = `<!DOCTYPE html>
   rafId = requestAnimationFrame(tick);
   setInterval(fetchData, REFRESH_MS);
 
+  // 跨頁同步: 從 archive 回來 (visibility change) 立即刷新
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') fetchData();
+  });
+  window.addEventListener('focus', fetchData);
+
   // 視窗大小變動
   let resizeT = null;
   window.addEventListener('resize', () => {
@@ -488,6 +625,9 @@ export const exhibitHtml = `<!DOCTYPE html>
 
   // 鍵盤(布展調試)
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      if (lightbox.classList.contains('open')) { closeLightbox(); return; }
+    }
     if (e.key === 'ArrowLeft')  { offset -= unitWidth || 200; userActiveUntil = performance.now() + RESUME_DELAY; }
     else if (e.key === 'ArrowRight') { offset += unitWidth || 200; userActiveUntil = performance.now() + RESUME_DELAY; }
     else if (e.key === ' ')     { e.preventDefault(); userActiveUntil = performance.now() + 999999999; }

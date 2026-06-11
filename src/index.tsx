@@ -47,23 +47,36 @@ async function ensureD1Schema(db: D1Database): Promise<void> {
 }
 
 async function saveEcho(env: Bindings, id: string, record: EchoRecord): Promise<void> {
+  let d1ok = false
   if (env.DB) {
     try {
       await ensureD1Schema(env.DB)
       await env.DB.prepare(
         "INSERT OR REPLACE INTO echoes (id, art, text, voice, title, curatorNote, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)"
       ).bind(id, record.art, record.text, record.voice, record.title, record.curatorNote, record.createdAt).run()
-      return
+      // 写后读回, 确认 D1 commit 真的完成 (修复"只显示最新一条"的根因)
+      const verify = await env.DB.prepare("SELECT id FROM echoes WHERE id = ?").bind(id).first()
+      if (verify) {
+        d1ok = true
+      } else {
+        console.warn('[D1 saveEcho] write succeeded but read-back returned null, id=', id)
+      }
     } catch (e) {
       console.warn('[D1 saveEcho] error:', (e as Error)?.message)
-      // fallthrough to KV/memory
     }
   }
+  // 双写: D1 即使成功也同时写 KV/memory 一份作为兜底, 避免 D1 边缘节点同步延迟导致列表读不到
   if (env.ECHO_KV) {
-    await env.ECHO_KV.put(`echo:${id}`, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 30 })
-    return
+    try {
+      await env.ECHO_KV.put(`echo:${id}`, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 90 })
+    } catch (e) {
+      console.warn('[KV saveEcho] error:', (e as Error)?.message)
+    }
   }
   memoryStore.set(id, record)
+  if (!d1ok && !env.ECHO_KV) {
+    console.warn('[saveEcho] persisted only in memory (will not survive worker restart)')
+  }
 }
 
 async function loadEcho(env: Bindings, id: string): Promise<EchoRecord | null> {
@@ -83,26 +96,71 @@ async function loadEcho(env: Bindings, id: string): Promise<EchoRecord | null> {
   return memoryStore.get(id) || null
 }
 
-// ========== 风格定义 ==========
+async function updateEcho(env: Bindings, id: string, patch: Partial<Pick<EchoRecord, 'title' | 'curatorNote' | 'voice'>>): Promise<EchoRecord | null> {
+  const existing = await loadEcho(env, id)
+  if (!existing) return null
+  const updated: EchoRecord = {
+    ...existing,
+    title: patch.title !== undefined ? patch.title : existing.title,
+    curatorNote: patch.curatorNote !== undefined ? patch.curatorNote : existing.curatorNote,
+    voice: patch.voice && VOICES[patch.voice] ? patch.voice : existing.voice,
+  }
+  await saveEcho(env, id, updated)
+  return updated
+}
+
+async function deleteEcho(env: Bindings, id: string): Promise<boolean> {
+  let deleted = false
+  if (env.DB) {
+    try {
+      await ensureD1Schema(env.DB)
+      const res = await env.DB.prepare("DELETE FROM echoes WHERE id = ?").bind(id).run()
+      // D1 run() 返回 meta.changes 表示影响行数
+      if ((res as any)?.meta?.changes && (res as any).meta.changes > 0) deleted = true
+    } catch (e) {
+      console.warn('[D1 deleteEcho] error:', (e as Error)?.message)
+    }
+  }
+  if (env.ECHO_KV) {
+    try {
+      const had = await env.ECHO_KV.get(`echo:${id}`)
+      if (had) {
+        await env.ECHO_KV.delete(`echo:${id}`)
+        deleted = true
+      }
+    } catch (e) {
+      console.warn('[KV deleteEcho] error:', (e as Error)?.message)
+    }
+  }
+  if (memoryStore.has(id)) {
+    memoryStore.delete(id)
+    deleted = true
+  }
+  return deleted
+}
+
+// ========== 风格定义 (美术馆级艺术语言) ==========
+// 每种 voice 都引用真实艺术运动 / 大师风格 + 具体绘画媒介 + 情绪关键词,
+// 这样 Stable Diffusion 才会真的画"艺术品"而不是普通图片
 const VOICES: Record<string, { label: string; prompt: string; palette: string }> = {
   'sun-bleached': {
     label: 'Sun-bleached memory',
-    prompt: 'sun-faded film photograph aesthetic, warm amber and gold leaf tones, hazy summer light, grainy texture, washed-out highlights, dreamlike nostalgia, soft golden hour glow',
+    prompt: 'oil painting in the style of Andrew Wyeth and Edward Hopper, sun-bleached pastoral landscape, golden ochre and faded sienna palette, soft impasto brushwork, museum exhibition piece, melancholic warmth of summer afternoon, faded photographic memory rendered in oil on linen, fine art gallery quality',
     palette: '#D4AF7A',
   },
   'underwater': {
     label: 'Underwater dream',
-    prompt: 'underwater dream aesthetic, refracted teal and sapphire light, soft caustic patterns, weightless suspension, blurred edges as if seen through deep water, ethereal aquatic surrealism',
+    prompt: 'abstract painting in the style of Helen Frankenthaler and Mark Rothko, submerged dreamlike composition, deep teal and prussian blue washes, color field painting with translucent layers, soft caustic light filtering through liquid space, contemporary museum acquisition, oil and acrylic on canvas, emotionally resonant aquatic abstraction',
     palette: '#7AB8D4',
   },
   'velvet-midnight': {
     label: 'Velvet midnight',
-    prompt: 'velvet midnight aesthetic, deep indigo and violet tones, scattered stardust, soft moonlit glow, cosmic surrealism, gentle bokeh, intimate nocturnal quietude',
+    prompt: 'oil painting in the style of Vija Celmins and Anselm Kiefer, deep velvet night sky composition, indigo violet and ink black palette with scattered silver pinpricks, contemplative cosmic abstraction, textured surface with stardust impasto, museum-grade fine art, intimate nocturnal solitude rendered in painterly brushwork',
     palette: '#9F7AEA',
   },
   'pressed-flower': {
     label: 'Pressed flower',
-    prompt: 'pressed flower aesthetic, faded sepia and dusty rose tones, aged paper texture, botanical illustration sensibility, delicate translucent petals, vintage herbarium specimen quality',
+    prompt: 'mixed media artwork in the style of Cy Twombly and Kiki Smith, pressed botanical specimens on aged parchment, sepia and dusty rose with faded carmine, delicate ink lines and watercolor washes, vintage herbarium aesthetic elevated to fine art, gallery exhibition piece, intimate meditative composition with translucent petals',
     palette: '#C9A4A4',
   },
 }
@@ -152,7 +210,11 @@ app.post('/api/generate', async (c) => {
 
     const voice = VOICES[voiceKey]
 
-    const artPrompt = `${voice.prompt}, inspired by the memory: "${memoryText}", abstract figurative art, double exposure, museum-quality fine art, painterly, no human faces, no text, no letters, no signature, vertical composition, evocative atmosphere, masterful composition`
+    // 把用户的记忆提炼成"情绪/意象关键词"而非直译,
+    // 避免 SD 把原文当成具象指令(否则会出"按字面画的插画"而非画廊艺术品)
+    const memoryEssence = distillMemoryEssence(memoryText)
+
+    const artPrompt = `${voice.prompt}, evoking ${memoryEssence}, non-figurative abstract composition, no human faces, no figures, no text, no letters, no watermarks, no signature, painterly brushstrokes, layered translucent textures, museum exhibition piece, fine art gallery acquisition quality, masterful composition with negative space, contemplative emotional resonance, award-winning contemporary fine art --no photorealism, no illustration, no cartoon, no anime`
 
     const seed = Math.floor(Math.random() * 1_000_000_000)
     let base64Image: string = ''
@@ -243,6 +305,56 @@ app.post('/api/generate', async (c) => {
     return c.json({ error: e?.message || 'Internal error' }, 500)
   }
 })
+
+// ========== 把用户记忆文本 -> "情绪 + 意象"关键词 ==========
+// 关键: 不能把原文直接塞 SD prompt (无论中英),
+// 否则 SD 会按字面画 -> 出来像插画/图鉴, 没有画廊艺术性.
+// 这里用关键词词典做意象提取, 提取到的词作为"情绪/氛围"加入 prompt,
+// 让 AI 围绕这些氛围画抽象艺术品.
+const ESSENCE_LEXICON: Array<[RegExp, string]> = [
+  // 自然 / 景物
+  [/sea|ocean|wave|tide|salt|shore|beach|海|浪|潮|岸/i, 'oceanic depth, undulating tidal forms'],
+  [/sky|cloud|star|moon|sun|dawn|dusk|sunset|sunrise|天空|云|星|月|阳|黎明|黄昏/i, 'celestial vastness, atmospheric luminosity'],
+  [/forest|tree|leaf|wood|garden|flower|petal|bloom|林|树|叶|花|园|花瓣|盛开/i, 'botanical organic forms, vegetal abstraction'],
+  [/rain|storm|fog|mist|snow|wind|雨|雾|雪|风|暴/i, 'atmospheric weather phenomena, soft veiled diffusion'],
+  [/mountain|hill|stone|rock|cliff|山|石|岩|悬崖/i, 'monumental geological strata'],
+  [/river|lake|stream|pond|water|liquid|河|湖|溪|塘|水/i, 'fluid reflective surfaces'],
+  [/fire|flame|burn|ember|ash|火|焰|烧|烬|灰/i, 'incandescent ember warmth'],
+  // 情绪
+  [/love|kiss|embrace|tender|warm|爱|吻|拥抱|温柔|温暖/i, 'tender intimate warmth'],
+  [/sad|cry|tear|grief|mourn|loss|lonely|miss|悲|哭|泪|伤|失|孤|想念|思念/i, 'melancholic solitude, quiet grief'],
+  [/joy|laugh|smile|happy|celebrate|喜|笑|乐|快乐|庆祝/i, 'luminous joy, radiant lightness'],
+  [/fear|afraid|dark|shadow|惧|怕|暗|阴影/i, 'shadowed apprehension'],
+  [/hope|dream|wish|future|希望|梦|愿|未来/i, 'aspirational ascending light'],
+  [/quiet|silent|still|peace|静|寂|宁|和平/i, 'tranquil silent stillness'],
+  // 时间
+  [/childhood|young|child|kid|baby|童|孩|幼|小时候/i, 'childhood ephemeral innocence'],
+  [/old|age|years|past|memory|forget|老|岁|往|忆|忘/i, 'time-worn faded patina, layered memory'],
+  [/night|midnight|sleep|夜|午夜|深夜|睡/i, 'deep nocturnal intimacy'],
+  [/morning|早晨|清晨/i, 'dawn awakening light'],
+  // 人 / 关系
+  [/mother|father|grandmother|grandfather|family|妈|爸|奶奶|外婆|爷爷|家|家人/i, 'familial tender bonds, ancestral warmth'],
+  [/friend|朋友|挚友/i, 'companionable warmth'],
+  [/lover|partner|her|him|she|he|恋人|她|他/i, 'intimate emotional presence'],
+  // 物
+  [/letter|paper|book|page|word|信|纸|书|页|字/i, 'aged parchment textures, ink traces'],
+  [/music|song|melody|sound|音乐|歌|旋律|声音/i, 'rhythmic harmonic vibrations'],
+  [/house|home|room|window|door|家|房|屋|窗|门/i, 'enclosed intimate domestic space'],
+  [/photo|picture|image|mirror|照片|图|镜/i, 'reflective doubled imagery'],
+]
+
+function distillMemoryEssence(text: string): string {
+  const matches: string[] = []
+  for (const [re, essence] of ESSENCE_LEXICON) {
+    if (re.test(text) && !matches.includes(essence)) matches.push(essence)
+    if (matches.length >= 4) break  // 太多会冲淡画面, 取最多 4 个意象
+  }
+  if (matches.length === 0) {
+    // 没匹配到具体意象 -> 给一个普适的诗意氛围
+    return 'wordless emotional resonance, abstract memory traces, ineffable feeling'
+  }
+  return matches.join(', ')
+}
 
 // seed-based PRNG -> 让每次占位图也不一样,不再千篇一律
 function seededRandom(seed: number) {
@@ -405,6 +517,9 @@ function decorate(id: string, r: EchoRecord): EchoListItem {
 }
 
 async function listAllEchoes(env: Bindings): Promise<EchoListItem[]> {
+  // 并合三层数据源以最大化健壮性 — 任一层失败/同步延迟,其他层兜底
+  const byId = new Map<string, EchoRecord>()
+
   // L1: D1
   if (env.DB) {
     try {
@@ -412,44 +527,87 @@ async function listAllEchoes(env: Bindings): Promise<EchoListItem[]> {
       const { results } = await env.DB.prepare(
         "SELECT id, art, text, voice, title, curatorNote, createdAt FROM echoes ORDER BY createdAt DESC LIMIT 1000"
       ).all<{ id: string } & EchoRecord>()
-      if (results && results.length > 0) {
-        return results.map(r => decorate(r.id, r))
+      if (results) {
+        for (const r of results) {
+          byId.set(r.id, { art: r.art, text: r.text, voice: r.voice, title: r.title, curatorNote: r.curatorNote, createdAt: r.createdAt })
+        }
       }
     } catch (e) {
       console.warn('[D1 listAll] error:', (e as Error)?.message)
     }
   }
-  // L2: KV
-  const items: EchoListItem[] = []
+
+  // L2: KV (作为兜底, 不替换 D1 已有数据)
   if (env.ECHO_KV) {
-    const list = await env.ECHO_KV.list({ prefix: 'echo:', limit: 1000 })
-    for (const k of list.keys) {
-      const raw = await env.ECHO_KV.get(k.name)
-      if (!raw) continue
-      try {
-        const r: EchoRecord = JSON.parse(raw)
+    try {
+      const list = await env.ECHO_KV.list({ prefix: 'echo:', limit: 1000 })
+      for (const k of list.keys) {
         const id = k.name.replace(/^echo:/, '')
-        items.push(decorate(id, r))
-      } catch {}
-    }
-  } else {
-    // L3: 内存
-    for (const [id, r] of memoryStore.entries()) {
-      items.push(decorate(id, r))
+        if (byId.has(id)) continue
+        const raw = await env.ECHO_KV.get(k.name)
+        if (!raw) continue
+        try { byId.set(id, JSON.parse(raw) as EchoRecord) } catch {}
+      }
+    } catch (e) {
+      console.warn('[KV listAll] error:', (e as Error)?.message)
     }
   }
+
+  // L3: memory (本节点最新, 兜底刚写入但 D1/KV 还没全球同步的数据)
+  for (const [id, r] of memoryStore.entries()) {
+    if (!byId.has(id)) byId.set(id, r)
+  }
+
+  const items: EchoListItem[] = []
+  for (const [id, r] of byId.entries()) items.push(decorate(id, r))
   items.sort((a, b) => b.createdAt - a.createdAt)
   return items
 }
 
+// 强制 no-cache, 避免 CF 边缘缓存或浏览器缓存让 archive/exhibit 看到旧数据
+const NO_CACHE_HEADERS = {
+  'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+  'Pragma': 'no-cache',
+  'Expires': '0',
+}
+
 app.get('/api/exhibit', async (c) => {
   const items = await listAllEchoes(c.env)
+  for (const [k, v] of Object.entries(NO_CACHE_HEADERS)) c.header(k, v)
   return c.json({ count: items.length, updatedAt: Date.now(), items })
 })
 
 app.get('/api/archive', async (c) => {
   const items = await listAllEchoes(c.env)
-  return c.json({ count: items.length, items })
+  for (const [k, v] of Object.entries(NO_CACHE_HEADERS)) c.header(k, v)
+  return c.json({ count: items.length, updatedAt: Date.now(), items })
+})
+
+// ========== 单条作品的 编辑 / 删除 ==========
+app.put('/api/echo/:id', async (c) => {
+  const id = c.req.param('id')
+  let patch: any = {}
+  try { patch = await c.req.json() } catch {}
+  const allowed: any = {}
+  if (typeof patch.title === 'string') allowed.title = patch.title.trim().slice(0, 120)
+  if (typeof patch.curatorNote === 'string') allowed.curatorNote = patch.curatorNote.trim().slice(0, 600)
+  if (typeof patch.voice === 'string' && VOICES[patch.voice]) allowed.voice = patch.voice
+  if (Object.keys(allowed).length === 0) {
+    return c.json({ error: 'No editable fields provided. Allowed: title, curatorNote, voice' }, 400)
+  }
+  const updated = await updateEcho(c.env, id, allowed)
+  if (!updated) return c.json({ error: 'Not found' }, 404)
+  const voice = VOICES[updated.voice] || VOICES['velvet-midnight']
+  for (const [k, v] of Object.entries(NO_CACHE_HEADERS)) c.header(k, v)
+  return c.json({ id, ...updated, number: formatEchoNumber(id, updated.createdAt), voiceLabel: voice.label, palette: voice.palette })
+})
+
+app.delete('/api/echo/:id', async (c) => {
+  const id = c.req.param('id')
+  const ok = await deleteEcho(c.env, id)
+  for (const [k, v] of Object.entries(NO_CACHE_HEADERS)) c.header(k, v)
+  if (!ok) return c.json({ error: 'Not found' }, 404)
+  return c.json({ ok: true, id })
 })
 
 // ===================================================================
@@ -1325,7 +1483,7 @@ app.get('/api/health', (c) => c.json({
   ai_provider: 'cf-workers-ai (primary) → ai-horde (fallback) → svg',
   ai_binding: !!c.env.AI,
   storage: c.env.DB ? 'd1' : (c.env.ECHO_KV ? 'kv' : 'memory'),
-  version: 'v5-cfai-primary',
+  version: 'v6-curate-fullscreen-artistry',
 }))
 
 // 诊断端点: 测试 AI binding 是否真的能出图, 不写库
