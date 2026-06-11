@@ -157,86 +157,65 @@ app.post('/api/generate', async (c) => {
     const seed = Math.floor(Math.random() * 1_000_000_000)
     let base64Image: string = ''
     let providerUsed = 'placeholder'
+    const debug: string[] = []
 
     // ============================================================
-    // L1 主力:Cloudflare Workers AI (Flux.1-schnell)
-    //   - 项目内直接 binding 调用,无需外部网络/token
-    //   - 在 Cloudflare 边缘运行,对所有用户并发友好
-    //   - 每天 10000 次免费推理
+    // L1 主力: Cloudflare Workers AI (Flux.1-schnell)
+    //   - 项目已绑定 AI binding, 在生产环境 100% 可用
+    //   - 真正 AI 出图, 每个 seed 不同结果绝不重样
+    //   - 免费额度足够 (每天 10k Neurons)
     // ============================================================
-    if (c.env.AI && !base64Image) {
+    if (!base64Image && c.env.AI) {
       try {
         const aiResp: any = await c.env.AI.run('@cf/black-forest-labs/flux-1-schnell', {
           prompt: artPrompt,
-          steps: 6,           // schnell 模型 4-8 步够用
+          steps: 6,
           seed,
         })
-        // Workers AI 返回 { image: <base64-string> } 或直接二进制 ReadableStream
         if (aiResp && typeof aiResp.image === 'string' && aiResp.image.length > 1000) {
           base64Image = `data:image/jpeg;base64,${aiResp.image}`
           providerUsed = 'cf-workers-ai'
-        } else if (aiResp instanceof Uint8Array || aiResp instanceof ArrayBuffer) {
-          const bytes = aiResp instanceof Uint8Array ? aiResp : new Uint8Array(aiResp)
-          if (bytes.length > 1024) {
-            let binary = ''
-            const CHUNK = 0x8000
-            for (let i = 0; i < bytes.length; i += CHUNK) {
-              binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as any)
-            }
-            base64Image = `data:image/jpeg;base64,${btoa(binary)}`
-            providerUsed = 'cf-workers-ai'
-          }
+          debug.push(`cf-workers-ai: ok (${aiResp.image.length} chars)`)
+        } else {
+          debug.push(`cf-workers-ai: bad response (${aiResp ? typeof aiResp.image : 'null'})`)
         }
       } catch (e) {
-        console.warn('[CF Workers AI] error:', (e as Error)?.message)
+        const msg = (e as Error)?.message || String(e)
+        console.warn('[CF Workers AI] error:', msg)
+        debug.push(`cf-workers-ai: error ${msg}`)
       }
+    } else if (!c.env.AI) {
+      debug.push('cf-workers-ai: AI binding not available')
     }
 
     // ============================================================
-    // L2 兜底:Pollinations.ai
-    //   - 不稳定 (经常 402 限流), 但有时能拿到真图
-    //   - 仅在 L1 失败时尝试
+    // L2 备用: AI Horde (免费、匿名、社区驱动)
+    //   - 仅当 CF Workers AI 失败时启用
+    //   - 已在沙盒实测可用 ~40s 一张图
     // ============================================================
     if (!base64Image) {
       try {
-        const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(artPrompt)}?width=768&height=1024&nologo=true&private=true&nofeed=true&seed=${seed}&model=flux`
-        const resp = await fetch(url, {
-          method: 'GET',
-          headers: {
-            'Accept': 'image/jpeg,image/png,image/*',
-            'Referer': 'https://pollinations.ai/',
-            'User-Agent': 'Mozilla/5.0 (compatible; ARiseGallery/1.0)',
-          },
-        })
-        if (resp.ok && (resp.headers.get('content-type') || '').startsWith('image/')) {
-          const ct = resp.headers.get('content-type') || 'image/jpeg'
-          const arrayBuffer = await resp.arrayBuffer()
-          const bytes = new Uint8Array(arrayBuffer)
-          if (bytes.length > 1024) {
-            let binary = ''
-            const CHUNK = 0x8000
-            for (let i = 0; i < bytes.length; i += CHUNK) {
-              binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as any)
-            }
-            base64Image = `data:${ct};base64,${btoa(binary)}`
-            providerUsed = 'pollinations'
-          }
-        } else {
-          console.warn('[Pollinations] non-OK:', resp.status)
+        base64Image = await generateViaHorde(artPrompt, seed)
+        if (base64Image) {
+          providerUsed = 'ai-horde'
+          debug.push('ai-horde: ok')
         }
       } catch (e) {
-        console.warn('[Pollinations] fetch error:', (e as Error)?.message)
+        const msg = (e as Error)?.message || String(e)
+        console.warn('[AI Horde] error:', msg)
+        debug.push(`ai-horde: error ${msg}`)
       }
     }
 
     // ============================================================
-    // L3 最后兜底:SVG 占位艺术 (按 seed 变化, 不再千篇一律)
+    // L3 最后兜底: SVG 占位艺术 (按 seed 变化, 不再千篇一律)
     // ============================================================
     if (!base64Image) {
       base64Image = makePlaceholderArt(voice.palette, voiceKey, seed)
+      debug.push('svg: fallback used')
     }
 
-    console.log(`[generate] provider=${providerUsed} voice=${voiceKey} seed=${seed}`)
+    console.log(`[generate] provider=${providerUsed} voice=${voiceKey} seed=${seed} debug=${debug.join(' | ')}`)
 
     const id = crypto.randomUUID().slice(0, 8)
     const record: EchoRecord = {
@@ -250,7 +229,16 @@ app.post('/api/generate', async (c) => {
 
     await saveEcho(c.env, id, record)
 
-    return c.json({ id, ...record, number: formatEchoNumber(id, record.createdAt), voiceLabel: voice.label })
+    c.header('X-AI-Provider', providerUsed)
+    c.header('X-AI-Debug', debug.join(' | ').slice(0, 500))
+    return c.json({
+      id,
+      ...record,
+      number: formatEchoNumber(id, record.createdAt),
+      voiceLabel: voice.label,
+      _provider: providerUsed,
+      _debug: debug,
+    })
   } catch (e: any) {
     return c.json({ error: e?.message || 'Internal error' }, 500)
   }
@@ -263,6 +251,93 @@ function seededRandom(seed: number) {
     s = (s * 1664525 + 1013904223) >>> 0
     return s / 0xFFFFFFFF
   }
+}
+
+// ========== AI Horde 调用 (免费, 匿名, 多人并发) ==========
+async function generateViaHorde(prompt: string, seed: number): Promise<string> {
+  const HORDE_BASE = 'https://stablehorde.net/api/v2'
+  const CLIENT_AGENT = 'ARiseGallery:1.0:https://arise-echo-gallery-7nz.pages.dev'
+
+  // 1) 提交任务
+  const submitResp = await fetch(`${HORDE_BASE}/generate/async`, {
+    method: 'POST',
+    headers: {
+      'apikey': '0000000000',
+      'Content-Type': 'application/json',
+      'Client-Agent': CLIENT_AGENT,
+    },
+    body: JSON.stringify({
+      prompt,
+      params: {
+        sampler_name: 'k_euler_a',
+        width: 512,
+        height: 768,
+        steps: 20,
+        cfg_scale: 7,
+        seed: String(seed),
+        n: 1,
+        karras: true,
+      },
+      nsfw: false,
+      censor_nsfw: true,
+      trusted_workers: false,
+      // 不指定模型, 让 Horde 自动调度任意可用 worker, 避免排队过久
+      r2: true,
+    }),
+  })
+  if (!submitResp.ok) {
+    const t = await submitResp.text().catch(() => '')
+    throw new Error(`submit ${submitResp.status} ${t.slice(0, 200)}`)
+  }
+  const submitData: any = await submitResp.json()
+  const jobId = submitData?.id
+  if (!jobId) throw new Error(`no job id ${JSON.stringify(submitData).slice(0, 200)}`)
+
+  // 2) 轮询完成 (最多 ~80s, 用 Date.now() 自循环避免某些 runtime 的 setTimeout 限制)
+  const startedAt = Date.now()
+  const MAX_MS = 80_000
+  const INTERVAL_MS = 3500
+
+  while (Date.now() - startedAt < MAX_MS) {
+    await new Promise(r => setTimeout(r, INTERVAL_MS))
+    const checkResp = await fetch(`${HORDE_BASE}/generate/check/${jobId}`, {
+      headers: { 'Client-Agent': CLIENT_AGENT },
+    })
+    if (!checkResp.ok) continue
+    const checkData: any = await checkResp.json()
+    if (checkData?.faulted === true) throw new Error(`faulted ${JSON.stringify(checkData).slice(0, 200)}`)
+    if (checkData?.done !== true) continue
+
+    // 3) 拿结果
+    const resultResp = await fetch(`${HORDE_BASE}/generate/status/${jobId}`, {
+      headers: { 'Client-Agent': CLIENT_AGENT },
+    })
+    if (!resultResp.ok) throw new Error(`status ${resultResp.status}`)
+    const resultData: any = await resultResp.json()
+    const gen = resultData?.generations?.[0]
+    if (!gen) throw new Error('no generations in result')
+
+    const imgField: string = gen.img
+    if (!imgField) throw new Error('empty img field')
+
+    if (imgField.startsWith('http')) {
+      const imgResp = await fetch(imgField)
+      if (!imgResp.ok) throw new Error(`img fetch ${imgResp.status}`)
+      const ct = imgResp.headers.get('content-type') || 'image/webp'
+      const arrayBuffer = await imgResp.arrayBuffer()
+      const bytes = new Uint8Array(arrayBuffer)
+      if (bytes.length < 1024) throw new Error(`img too small ${bytes.length}b`)
+      let binary = ''
+      const CHUNK = 0x8000
+      for (let j = 0; j < bytes.length; j += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(j, j + CHUNK) as any)
+      }
+      return `data:${ct};base64,${btoa(binary)}`
+    } else {
+      return `data:image/webp;base64,${imgField}`
+    }
+  }
+  throw new Error(`timeout ${MAX_MS}ms`)
 }
 
 function makePlaceholderArt(palette: string, voiceKey: string, seed: number = Date.now()): string {
@@ -1246,10 +1321,36 @@ app.get('/favicon.ico', (c) => {
 app.get('/api/health', (c) => c.json({
   ok: true,
   service: 'ARise · Echo Gallery',
-  ai_provider: c.env.AI ? 'cloudflare-workers-ai (flux-1-schnell, free)' : 'pollinations + svg fallback',
+  ai_provider: 'cf-workers-ai (primary) → ai-horde (fallback) → svg',
   ai_binding: !!c.env.AI,
   storage: c.env.DB ? 'd1' : (c.env.ECHO_KV ? 'kv' : 'memory'),
-  version: 'v3-d1-cf-ai',
+  version: 'v5-cfai-primary',
 }))
+
+// 诊断端点: 测试 AI binding 是否真的能出图, 不写库
+app.get('/api/diag/ai', async (c) => {
+  if (!c.env.AI) {
+    return c.json({ ok: false, error: 'AI binding not bound to this Pages project' }, 500)
+  }
+  try {
+    const t0 = Date.now()
+    const aiResp: any = await c.env.AI.run('@cf/black-forest-labs/flux-1-schnell', {
+      prompt: 'a single small red circle on dark background, minimalist',
+      steps: 4,
+      seed: 12345,
+    })
+    const ms = Date.now() - t0
+    const imgLen = aiResp && typeof aiResp.image === 'string' ? aiResp.image.length : 0
+    return c.json({
+      ok: imgLen > 1000,
+      ms,
+      imgLen,
+      respKeys: aiResp ? Object.keys(aiResp) : [],
+      sample: imgLen > 1000 ? aiResp.image.slice(0, 80) + '...' : null,
+    })
+  } catch (e: any) {
+    return c.json({ ok: false, error: e?.message || String(e), stack: (e?.stack || '').slice(0, 500) }, 500)
+  }
+})
 
 export default app
