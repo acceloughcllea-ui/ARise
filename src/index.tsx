@@ -1543,7 +1543,7 @@ app.get('/api/health', (c) => c.json({
   ai_provider: 'cf-workers-ai (primary) → ai-horde (fallback) → svg',
   ai_binding: !!c.env.AI,
   storage: c.env.DB ? 'd1' : (c.env.ECHO_KV ? 'kv' : 'memory'),
-  version: 'v6.3-rebuild-schema',
+  version: 'v6.4-gallery-redesign',
 }))
 
 // 诊断端点: 测试 D1 真实读写状态 + 自动迁移

@@ -51,51 +51,88 @@ export const exhibitHtml = `<!DOCTYPE html>
   html.dragging, html.dragging body { cursor: grabbing; }
   body { user-select: none; -webkit-user-select: none; }
 
-  /* === 舞台背景:深紫穹頂 + 微弱金塵 === */
+  /* === 舞台背景:深紫穹頂 + 鹿絨牆面紋理 + 金塵 === */
   .stage {
     position: fixed; inset: 0;
     background:
-      radial-gradient(ellipse at 50% 38%, #1d1431 0%, #0c0716 52%, #050309 100%);
+      /* 牆面立面光斑(下方稍亮模擬展廳地面反光) */
+      radial-gradient(ellipse 90% 60% at 50% 110%, rgba(60,40,90,0.55) 0%, transparent 60%),
+      /* 主穹頂深紫漸層 */
+      radial-gradient(ellipse at 50% 32%, #261b42 0%, #100a1f 48%, #050309 100%);
     overflow: hidden;
     perspective: 2400px;
     perspective-origin: 50% 50%;
   }
+  /* 細密金塵粒 + 牆面豎向絨布紋理 */
   .stage::before {
     content: ''; position: absolute; inset: 0;
     background-image:
-      radial-gradient(1px 1px at 12% 20%, rgba(212,175,122,0.55), transparent 50%),
-      radial-gradient(1px 1px at 78% 35%, rgba(212,175,122,0.45), transparent 50%),
-      radial-gradient(1px 1px at 35% 70%, rgba(212,175,122,0.55), transparent 50%),
-      radial-gradient(1.2px 1.2px at 88% 82%, rgba(212,175,122,0.35), transparent 50%),
-      radial-gradient(1px 1px at 22% 88%, rgba(212,175,122,0.45), transparent 50%),
-      radial-gradient(1px 1px at 60% 12%, rgba(212,175,122,0.4), transparent 50%);
-    pointer-events: none; opacity: 0.7;
+      /* 金塵粒(更多更密) */
+      radial-gradient(1px 1px at 8% 18%, rgba(212,175,122,0.65), transparent 50%),
+      radial-gradient(1.2px 1.2px at 78% 35%, rgba(212,175,122,0.55), transparent 50%),
+      radial-gradient(1px 1px at 35% 70%, rgba(212,175,122,0.6), transparent 50%),
+      radial-gradient(1.3px 1.3px at 88% 82%, rgba(212,175,122,0.45), transparent 50%),
+      radial-gradient(1px 1px at 22% 88%, rgba(212,175,122,0.5), transparent 50%),
+      radial-gradient(1px 1px at 60% 12%, rgba(212,175,122,0.5), transparent 50%),
+      radial-gradient(0.8px 0.8px at 48% 48%, rgba(245,220,170,0.7), transparent 50%),
+      radial-gradient(0.8px 0.8px at 92% 18%, rgba(212,175,122,0.4), transparent 50%),
+      radial-gradient(1px 1px at 5% 55%, rgba(212,175,122,0.45), transparent 50%),
+      radial-gradient(1px 1px at 70% 92%, rgba(212,175,122,0.5), transparent 50%),
+      /* 豎向絨布紋理 (用極細條紋模擬展廳牆面) */
+      repeating-linear-gradient(90deg,
+        transparent 0, transparent 3px,
+        rgba(245,237,224,0.012) 3px, rgba(245,237,224,0.012) 4px);
+    pointer-events: none; opacity: 0.85;
+  }
+  /* 細密噪點(SVG turbulence 模擬紙面/牆面顆粒感) */
+  .stage::after {
+    content: ''; position: absolute; inset: 0;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.83  0 0 0 0 0.68  0 0 0 0 0.48  0 0 0 0.08 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    background-size: 240px 240px;
+    pointer-events: none; opacity: 0.55;
+    mix-blend-mode: overlay;
+    z-index: 1;
   }
 
-  /* === 中央聚光（已淡化,不再放大邊緣） === */
+  /* === 中央聚光（加強, 真實展廳射燈感） === */
   .spotlight {
     position: absolute;
     left: 50%; top: 50%;
     transform: translate(-50%, -50%);
-    width: 80vw; height: 50vh;
-    background: radial-gradient(ellipse at center, rgba(212,175,122,0.05) 0%, transparent 70%);
-    pointer-events: none; z-index: 1;
+    width: 90vw; height: 78vh;
+    background:
+      radial-gradient(ellipse 50% 60% at center, rgba(245,220,170,0.16) 0%, rgba(212,175,122,0.06) 35%, transparent 72%);
+    pointer-events: none; z-index: 2;
+    filter: blur(2px);
+  }
+  /* 第二層射燈:從畫作上方斜射下來的暖光錐 */
+  .spotlight::after {
+    content: ''; position: absolute;
+    left: 50%; top: -8vh;
+    transform: translateX(-50%);
+    width: 60vw; height: 50vh;
+    background: linear-gradient(180deg, rgba(245,220,170,0.10) 0%, transparent 80%);
+    clip-path: polygon(35% 0, 65% 0, 88% 100%, 12% 100%);
+    pointer-events: none;
+    filter: blur(8px);
   }
 
-  /* === 走馬燈軌道（純平面,匀速平移） === */
+  /* === 走馬燈軌道（更大畫作, 佔據主視覺） === */
   .marquee {
     position: absolute;
-    top: 54%; left: 0;
-    height: 44vh;
+    top: 52%; left: 0;
+    height: 68vh;
     display: flex;
     align-items: center;
-    gap: 3.6vh;
+    gap: 3.2vh;
     will-change: transform;
+    z-index: 6;
   }
-  /* 畫作軌道上下對稱位置(用於金線錨定):54% ± 22vh */
+  /* 畫作軌道上下對稱位置(用於金線錨定):52% ± 34vh */
 
   /* === 單件作品（等大清晰,不縮放不模糊） === */
   .piece {
+    position: relative;
     flex: 0 0 auto;
     height: 100%;
     aspect-ratio: 3 / 4;
@@ -106,28 +143,67 @@ export const exhibitHtml = `<!DOCTYPE html>
     gap: 1.6vh;
   }
 
-  /* === 畫作金邊裱框 === */
+  /* === 畫作金邊裱框(更厚重 / 雙鎏金邊 / 內陰影) === */
   .artframe {
     position: relative;
-    height: calc(100% - 6vh);
+    height: calc(100% - 7vh);
     aspect-ratio: 3 / 4;
     background: #0a0612;
+    /* 多層 box-shadow 模擬實體相框:深木色內襯 → 鎏金外緣 → 金光暈 → 投影 → 色暈 */
     box-shadow:
-      0 0 0 5px #1a1208,
-      0 0 0 7px #D4AF7A,
-      0 0 0 8px rgba(212,175,122,0.45),
-      0 18px 48px rgba(0,0,0,0.85),
-      0 0 100px var(--glow, rgba(159,122,234,0.16));
+      0 0 0 3px #0e0a18,                            /* 最內側暗線 */
+      0 0 0 6px #2a1d0e,                            /* 深木色內襯 */
+      0 0 0 10px #D4AF7A,                           /* 主鎏金邊 (更厚) */
+      0 0 0 12px #8a6534,                           /* 鎏金外側暗紋 */
+      0 0 0 14px rgba(212,175,122,0.55),            /* 金光暈 */
+      0 28px 60px rgba(0,0,0,0.92),                 /* 落地投影 */
+      0 8px 20px rgba(0,0,0,0.7),                   /* 近端柔影 */
+      0 0 140px var(--glow, rgba(159,122,234,0.28)); /* 色彩光暈(隨 voice 變色) */
     overflow: hidden;
-    transition: box-shadow 0.6s ease;
+    transition: box-shadow 0.8s ease, transform 0.6s ease;
   }
+  /* 玻璃高光斜照 */
   .artframe::before {
     content: ''; position: absolute; inset: 0;
-    background: linear-gradient(160deg, rgba(255,235,200,0.10) 0%, transparent 35%, transparent 70%, rgba(0,0,0,0.30) 100%);
+    background:
+      linear-gradient(135deg, rgba(255,235,200,0.16) 0%, transparent 28%, transparent 65%, rgba(0,0,0,0.42) 100%),
+      /* 玻璃面細微反光 */
+      linear-gradient(45deg, transparent 48%, rgba(255,255,255,0.04) 50%, transparent 52%);
     pointer-events: none; z-index: 2;
+  }
+  /* 內側畫布紋理 */
+  .artframe::after {
+    content: ''; position: absolute; inset: 4px;
+    pointer-events: none; z-index: 3;
+    box-shadow:
+      inset 0 0 30px rgba(0,0,0,0.45),
+      inset 0 0 1px rgba(212,175,122,0.5);
   }
   .artframe img {
     width: 100%; height: 100%; object-fit: cover; display: block;
+  }
+  /* 畫框懸掛線(細鋼絲懸於畫上方延伸至天花) */
+  .artframe-wire {
+    position: absolute;
+    top: 0;
+    left: 50%;
+    width: 1px;
+    height: 3.2vh;
+    background: linear-gradient(180deg, transparent 0%, rgba(212,175,122,0.4) 40%, rgba(212,175,122,0.85) 100%);
+    transform: translate(-50%, -100%);
+    pointer-events: none;
+    z-index: 3;
+  }
+  /* 懸掛點金釘(畫框正上方頂端) */
+  .artframe-wire::before {
+    content: '';
+    position: absolute;
+    bottom: -3px; left: 50%;
+    width: 6px; height: 6px;
+    transform: translateX(-50%);
+    background: radial-gradient(circle, #f5dca8 0%, #D4AF7A 55%, #6e5028 100%);
+    border-radius: 50%;
+    box-shadow: 0 0 8px rgba(245,220,170,0.7);
   }
 
   /* === 全屏按鈕 (每幅畫右上角) === */
@@ -227,92 +303,122 @@ export const exhibitHtml = `<!DOCTYPE html>
   }
 
   /* === 兩側極淡羽化(只在最邊緣,不擋畫作) === */
-  .stage::after {
-    content: ''; position: absolute; inset: 0;
+  .stage-fade {
+    position: fixed; inset: 0;
     background:
-      linear-gradient(90deg, rgba(5,3,9,0.85) 0%, rgba(5,3,9,0.35) 3%, transparent 7%, transparent 93%, rgba(5,3,9,0.35) 97%, rgba(5,3,9,0.85) 100%);
+      linear-gradient(90deg, rgba(5,3,9,0.88) 0%, rgba(5,3,9,0.4) 2.5%, transparent 6%, transparent 94%, rgba(5,3,9,0.4) 97.5%, rgba(5,3,9,0.88) 100%);
     pointer-events: none;
     z-index: 5;
   }
 
-  /* === 新設計:畫作軌道上下兩條金線(藝廊掛畫線軌感) === */
+  /* === 畫作軌道上下兩條金線(藝廊掛畫鋼線軌感) === */
   .gold-line {
     position: absolute; left: 0; right: 0;
     height: 1px;
-    background: linear-gradient(90deg, transparent 0%, rgba(212,175,122,0.55) 18%, rgba(245,220,170,0.85) 50%, rgba(212,175,122,0.55) 82%, transparent 100%);
+    background: linear-gradient(90deg, transparent 0%, rgba(212,175,122,0.7) 12%, rgba(245,220,170,0.95) 50%, rgba(212,175,122,0.7) 88%, transparent 100%);
     z-index: 4; pointer-events: none;
-    box-shadow: 0 0 12px rgba(212,175,122,0.25);
+    box-shadow: 0 0 16px rgba(212,175,122,0.4), 0 1px 0 rgba(0,0,0,0.5);
   }
-  .gold-line.top    { top: calc(54% - 22vh - 2vh); }
-  .gold-line.bottom { top: calc(54% + 22vh + 2vh); }
+  .gold-line.top    { top: calc(52% - 34vh - 0.5vh); }
+  .gold-line.bottom { top: calc(52% + 34vh + 0.5vh); }
+  /* 金線上的等距金釘(展廳牆面打點的視覺) */
+  .gold-line::before, .gold-line::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    width: 6px; height: 6px;
+    background: radial-gradient(circle, #f5dca8 0%, #D4AF7A 60%, #6e5028 100%);
+    border-radius: 50%;
+    transform: translateY(-50%);
+    box-shadow: 0 0 8px rgba(245,220,170,0.7);
+  }
+  .gold-line::before { left: 8%; }
+  .gold-line::after  { right: 8%; }
 
-  /* === 頂部標題條(緊貼畫作上沿) === */
+  /* === 頂部標題條(緊湊單行+鎏金分隔) === */
   .header-bar {
-    position: absolute; top: 2.5vh; left: 0; right: 0;
+    position: absolute; top: 1.4vh; left: 0; right: 0;
     text-align: center;
     z-index: 50; pointer-events: none;
+    display: flex; align-items: center; justify-content: center; gap: 18px;
   }
   .header-bar .eyebrow {
     color: var(--gold);
     font-family: 'Inter', sans-serif;
-    font-size: clamp(11px, 1vw, 13px);
-    letter-spacing: 0.18em; text-transform: uppercase;
-    margin-bottom: 0.5vh;
+    font-size: clamp(10px, 0.85vw, 12px);
+    letter-spacing: 0.32em; text-transform: uppercase;
     opacity: 0.9;
+  }
+  .header-bar .divider {
+    width: 28px; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--gold), transparent);
+    opacity: 0.6;
   }
   .header-bar .brand {
     font-family: 'Cormorant Garamond', serif;
     font-style: italic; font-weight: 400;
-    font-size: clamp(26px, 3vw, 44px);
+    font-size: clamp(20px, 2.2vw, 32px);
     line-height: 1.1;
     color: #f5ede0;
-    letter-spacing: 0.02em;
+    letter-spacing: 0.04em;
+    text-shadow: 0 2px 12px rgba(0,0,0,0.6);
+  }
+  .header-bar .brand::first-letter {
+    color: var(--gold);
   }
 
-  /* === 底部小字條(固定,字號放大,手機可讀) === */
+  /* === 底部小字條(極簡, 不擋畫) === */
   .footer-bar {
-    position: fixed; bottom: 0; left: 0; right: 0;
-    text-align: center; padding: 2vh 0 2.4vh;
+    position: fixed; bottom: 0.6vh; left: 0; right: 0;
+    text-align: center; padding: 0.6vh 0;
     z-index: 50; pointer-events: none;
-    background: linear-gradient(0deg, rgba(5,3,9,0.95) 0%, rgba(5,3,9,0.6) 60%, transparent 100%);
   }
   .footer-bar .meta {
-    color: rgba(245,237,224,0.6);
-    font-size: clamp(10px, 0.85vw, 12px);
-    letter-spacing: 0.18em; text-transform: uppercase;
-  }
-  .footer-bar .div { display: inline-block; width: 24px; height: 1px; background: rgba(212,175,122,0.4); margin: 0 12px; vertical-align: middle; }
-
-  /* === 角标(字號放大) === */
-  .corner-r {
-    position: fixed; top: 1.5vh; right: 1.6vw;
-    font-size: clamp(10px, 0.8vw, 12px);
-    letter-spacing: 0.22em; text-transform: uppercase;
     color: rgba(245,237,224,0.45);
+    font-size: clamp(9px, 0.7vw, 11px);
+    letter-spacing: 0.32em; text-transform: uppercase;
+  }
+  .footer-bar .div { display: inline-block; width: 18px; height: 1px; background: rgba(212,175,122,0.4); margin: 0 10px; vertical-align: middle; }
+
+  /* === 角标(更含蓄) === */
+  .corner-r, .corner-l {
+    position: fixed; top: 1.4vh;
+    font-size: clamp(9px, 0.7vw, 11px);
+    letter-spacing: 0.32em; text-transform: uppercase;
+    color: rgba(245,237,224,0.4);
     z-index: 100; pointer-events: none;
   }
-  .corner-l {
-    position: fixed; top: 1.5vh; left: 1.6vw;
-    font-size: clamp(10px, 0.8vw, 12px);
-    letter-spacing: 0.22em; text-transform: uppercase;
-    color: rgba(245,237,224,0.45);
-    z-index: 100; pointer-events: none;
+  .corner-r { right: 1.6vw; }
+  .corner-l { left: 1.6vw; }
+  .corner-r::before, .corner-l::after {
+    content: '✦'; color: var(--gold); margin: 0 8px; opacity: 0.7;
   }
 
-  /* === 手機端進一步加大字級 + 簡化 footer === */
+  /* === 手機端調整(畫作仍佔主視覺) === */
   @media (max-width: 720px) {
-    .header-bar { top: 1.6vh; }
-    .header-bar .eyebrow { font-size: 11px; }
-    .header-bar .brand   { font-size: 24px; }
+    .header-bar { top: 1.2vh; gap: 10px; }
+    .header-bar .eyebrow { display: none; }
+    .header-bar .divider { display: none; }
+    .header-bar .brand   { font-size: 20px; }
     .nameplate .num   { font-size: 10px; letter-spacing: 0.22em; }
     .nameplate .ttl   { font-size: 14px; }
     .nameplate .voice { font-size: 10px; letter-spacing: 0.16em; }
-    .footer-bar .meta { font-size: 10px; letter-spacing: 0.12em; }
-    .footer-bar .div  { width: 14px; margin: 0 6px; }
-    .corner-l, .corner-r { font-size: 10px; letter-spacing: 0.16em; }
-    .marquee { height: 50vh; gap: 3vh; top: 52%; }
-    .gold-line.top    { top: calc(52% - 25vh - 1.6vh); }
-    .gold-line.bottom { top: calc(52% + 25vh + 1.6vh); }
+    .footer-bar .meta { font-size: 9px; letter-spacing: 0.18em; }
+    .footer-bar .div  { width: 12px; margin: 0 6px; }
+    .corner-l, .corner-r { font-size: 9px; letter-spacing: 0.2em; }
+    .marquee { height: 72vh; gap: 2.4vh; top: 50%; }
+    .gold-line.top    { top: calc(50% - 36vh - 0.5vh); }
+    .gold-line.bottom { top: calc(50% + 36vh + 0.5vh); }
+    .artframe { box-shadow:
+      0 0 0 2px #0e0a18,
+      0 0 0 4px #2a1d0e,
+      0 0 0 7px #D4AF7A,
+      0 0 0 8px #8a6534,
+      0 0 0 10px rgba(212,175,122,0.5),
+      0 18px 40px rgba(0,0,0,0.9),
+      0 0 100px var(--glow, rgba(159,122,234,0.25));
+    }
+    .artframe-wire { display: none; }
   }
 
   /* === 空集態 === */
@@ -338,8 +444,11 @@ export const exhibitHtml = `<!DOCTYPE html>
   <div class="corner-r" id="cornerCount">— pieces</div>
 
   <div class="header-bar">
-    <div class="eyebrow">ARise · Echo Gallery</div>
-    <div class="brand">低語的回響 · A Quiet Invitation</div>
+    <div class="eyebrow">ARise</div>
+    <span class="divider"></span>
+    <div class="brand">低語的回響</div>
+    <span class="divider"></span>
+    <div class="eyebrow">Echo Gallery</div>
   </div>
 
   <div class="stage">
@@ -353,6 +462,7 @@ export const exhibitHtml = `<!DOCTYPE html>
       <p>The first whisper has not yet been transmuted into art. As soon as a visitor scans, this wall will rise into life.</p>
     </div>
   </div>
+  <div class="stage-fade"></div>
 
   <div class="footer-bar">
     <span class="meta">arise-echo-gallery.pages.dev<span class="div"></span>低語的回響</span>
@@ -447,6 +557,7 @@ export const exhibitHtml = `<!DOCTYPE html>
     el.className = 'piece';
     el.style.setProperty('--glow', (item.palette || '#9F7AEA') + '55');
     el.innerHTML = \`
+      <div class="artframe-wire"></div>
       <div class="artframe">
         <button class="fs-btn" type="button" aria-label="View full screen" title="Full screen">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
