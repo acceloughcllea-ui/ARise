@@ -891,6 +891,289 @@ ${sharedHead}
   }
   .loader-sub { margin-top: 16px; font-size: 10px; letter-spacing: 0.4em; color: var(--ink-faint); text-transform: uppercase; }
 </style>
+
+<!-- ===== Artistic Layer v6.6: 美术馆级氛围 / 镏金装饰 / 噪点墙面 ===== -->
+<style>
+  /* === 大氛围: 深紫穹顶 + 金尘 + 织物墙面纹理(对齐 /exhibit 风格) === */
+  body {
+    background:
+      radial-gradient(ellipse 90% 60% at 50% 110%, rgba(60,40,90,0.4) 0%, transparent 60%),
+      radial-gradient(ellipse 70% 50% at 50% 0%, rgba(159,122,234,0.18) 0%, transparent 55%),
+      radial-gradient(ellipse at 50% 50%, #1a1130 0%, #0a0612 50%, #050309 100%);
+    position: relative;
+  }
+  /* 金尘粒子 (跟随滚动而非固定背景, 否则在长页面上重复明显) */
+  body::before {
+    content: ''; position: fixed; inset: 0;
+    pointer-events: none; z-index: 0; opacity: 0.85;
+    background-image:
+      radial-gradient(1px 1px at 8% 22%, rgba(212,175,122,0.65), transparent 50%),
+      radial-gradient(1.2px 1.2px at 78% 35%, rgba(212,175,122,0.55), transparent 50%),
+      radial-gradient(1px 1px at 35% 70%, rgba(212,175,122,0.6), transparent 50%),
+      radial-gradient(1.3px 1.3px at 88% 82%, rgba(212,175,122,0.45), transparent 50%),
+      radial-gradient(1px 1px at 22% 88%, rgba(212,175,122,0.5), transparent 50%),
+      radial-gradient(1px 1px at 60% 12%, rgba(212,175,122,0.5), transparent 50%),
+      radial-gradient(0.8px 0.8px at 48% 48%, rgba(245,220,170,0.7), transparent 50%),
+      radial-gradient(0.8px 0.8px at 92% 18%, rgba(212,175,122,0.4), transparent 50%),
+      radial-gradient(1px 1px at 5% 55%, rgba(212,175,122,0.45), transparent 50%),
+      radial-gradient(1px 1px at 70% 92%, rgba(212,175,122,0.5), transparent 50%);
+  }
+  /* SVG turbulence 噪点墙面材质 */
+  body::after {
+    content: ''; position: fixed; inset: 0;
+    pointer-events: none; z-index: 0; opacity: 0.5;
+    mix-blend-mode: overlay;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.83  0 0 0 0 0.68  0 0 0 0 0.48  0 0 0 0.08 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    background-size: 240px 240px;
+  }
+  /* 确保内容浮在 ::before/::after 之上 */
+  .progress-bar, .top-nav, .chapter, .loader-veil { position: relative; z-index: 1; }
+  .loader-veil { z-index: 200; }
+  .top-nav { z-index: 99; }
+  .progress-bar { z-index: 100; }
+
+  /* === Chapter 之间的装饰分隔条(每章末尾)=== */
+  .chapter + .chapter::before {
+    content: '✦';
+    position: absolute; top: 0; left: 50%;
+    transform: translate(-50%, -50%);
+    color: var(--gold); font-size: 14px;
+    background: var(--bg-deep);
+    padding: 0 16px;
+    text-shadow: 0 0 12px rgba(212,175,122,0.5);
+  }
+  .chapter + .chapter {
+    border-top: 1px solid rgba(212,175,122,0.18);
+  }
+
+  /* === Chapter 编号: 装饰罗马数字 + 两侧细金线 === */
+  .chapter-num {
+    display: inline-block !important;
+    padding: 0 24px;
+    position: relative;
+    font-size: 13px !important;
+    letter-spacing: 0.45em !important;
+  }
+  .chapter-num::before, .chapter-num::after {
+    content: '';
+    position: absolute; top: 50%;
+    width: 32px; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--gold));
+    opacity: 0.7;
+  }
+  .chapter-num::before { right: 100%; transform: translate(0, -50%) scaleX(-1); }
+  .chapter-num::after  { left: 100%;  transform: translateY(-50%); }
+
+  /* === Chapter 标题: 装饰首字母下沉(drop cap) === */
+  .chapter-title::first-letter {
+    font-size: 1.5em;
+    color: var(--gold);
+    font-style: italic;
+    line-height: 0.9;
+  }
+
+  /* === Chapter I: Fragment zone 升级为镏金装裱框 + 4 角装饰 === */
+  .fragment-zone {
+    border: none !important;
+    background: rgba(10,6,18,0.4);
+    box-shadow:
+      0 0 0 1px rgba(212,175,122,0.35),
+      0 0 0 4px #0e0a18,
+      0 0 0 5px rgba(212,175,122,0.6),
+      0 0 0 6px #6e5028,
+      0 16px 40px rgba(0,0,0,0.7),
+      0 0 60px rgba(159,122,234,0.18) inset;
+    width: 240px !important; height: 300px !important;
+  }
+  .fragment-zone:hover {
+    box-shadow:
+      0 0 0 1px rgba(245,220,170,0.6),
+      0 0 0 4px #0e0a18,
+      0 0 0 5px var(--gold),
+      0 0 0 6px #8a6534,
+      0 22px 60px rgba(0,0,0,0.85),
+      0 0 80px rgba(159,122,234,0.3) inset;
+  }
+  /* 4 角金色 L 形装饰 */
+  .fragment-zone::before, .fragment-zone::after {
+    content: ''; position: absolute;
+    width: 20px; height: 20px;
+    border: 1px solid var(--gold);
+    pointer-events: none;
+  }
+  .fragment-zone::before {
+    top: 12px; left: 12px;
+    border-right: none; border-bottom: none;
+  }
+  .fragment-zone::after {
+    bottom: 12px; right: 12px;
+    border-left: none; border-top: none;
+  }
+  .fragment-zone .plus {
+    font-size: 64px !important;
+    text-shadow: 0 0 24px rgba(212,175,122,0.5);
+    animation: plusBreathe 3s ease-in-out infinite;
+  }
+  @keyframes plusBreathe {
+    0%,100% { opacity: 0.7; transform: scale(1); }
+    50%     { opacity: 1.0; transform: scale(1.05); }
+  }
+
+  /* === Chapter II: Echo textarea 升级为美术馆铭牌样式 === */
+  .echo-input-wrap {
+    border-bottom: none !important;
+    padding: 32px 30px !important;
+    background: rgba(10,6,18,0.35);
+    position: relative;
+  }
+  /* 上下双金线 + 中间宝石点 */
+  .echo-input-wrap::before, .echo-input-wrap::after {
+    content: ''; position: absolute; left: 0; right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent 0%, rgba(212,175,122,0.7) 12%, rgba(245,220,170,0.9) 50%, rgba(212,175,122,0.7) 88%, transparent 100%);
+  }
+  .echo-input-wrap::before { top: 0; }
+  .echo-input-wrap::after  { bottom: 0; }
+  .echo-input-wrap:focus-within::before,
+  .echo-input-wrap:focus-within::after {
+    background: linear-gradient(90deg, transparent 0%, rgba(245,220,170,0.95) 12%, #f5dca8 50%, rgba(245,220,170,0.95) 88%, transparent 100%);
+    box-shadow: 0 0 12px rgba(245,220,170,0.4);
+  }
+  /* 左右两侧的小宝石装饰 */
+  .echo-input-wrap > .gem-l, .echo-input-wrap > .gem-r {
+    position: absolute; top: 50%;
+    width: 6px; height: 6px;
+    background: radial-gradient(circle, #f5dca8 0%, var(--gold) 60%, #6e5028 100%);
+    border-radius: 50%;
+    transform: translateY(-50%);
+    box-shadow: 0 0 8px rgba(245,220,170,0.7);
+    pointer-events: none;
+  }
+  .echo-input-wrap > .gem-l { left: 10px; }
+  .echo-input-wrap > .gem-r { right: 10px; }
+  /* 输入框首字母 drop cap 当聚焦且有字 */
+  .echo-input {
+    font-size: 24px !important;
+  }
+
+  /* === Chapter III: Voice 卡片升级为美术馆藏品卡 === */
+  .voice {
+    padding: 24px 18px 22px !important;
+    background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.15)) !important;
+    border: 1px solid rgba(212,175,122,0.2) !important;
+    box-shadow:
+      0 4px 16px rgba(0,0,0,0.4),
+      0 0 0 1px rgba(0,0,0,0.2) inset;
+    transition: all .5s cubic-bezier(0.2, 0.8, 0.2, 1) !important;
+  }
+  .voice:hover {
+    border-color: rgba(212,175,122,0.6) !important;
+    transform: translateY(-4px) !important;
+    box-shadow:
+      0 12px 28px rgba(0,0,0,0.6),
+      0 0 30px var(--swatch-color, rgba(212,175,122,0.2)),
+      0 0 0 1px rgba(212,175,122,0.3) inset;
+  }
+  .voice.active {
+    border-color: var(--gold) !important;
+    background: linear-gradient(180deg, rgba(212,175,122,0.10), rgba(212,175,122,0.04)) !important;
+    box-shadow:
+      0 8px 24px rgba(0,0,0,0.5),
+      0 0 32px var(--swatch-color, rgba(212,175,122,0.35)),
+      0 0 0 1px rgba(245,220,170,0.4) inset;
+  }
+  /* 卡片右上角小角标(藏品编号位) */
+  .voice::before {
+    content: '✦';
+    position: absolute; top: 8px; right: 10px;
+    color: rgba(212,175,122,0.3);
+    font-size: 10px;
+    transition: color .4s ease;
+  }
+  .voice.active::before { color: var(--gold); }
+  .voice .swatch {
+    width: 32px !important; height: 32px !important;
+    box-shadow:
+      0 0 0 1px rgba(0,0,0,0.5),
+      0 0 0 2px rgba(212,175,122,0.4),
+      0 0 20px var(--swatch-color);
+  }
+
+  /* === Summon button 升级: 镏金边 + 内呼吸 === */
+  .summon-btn {
+    position: relative;
+    border-width: 1px !important;
+    background: linear-gradient(180deg, rgba(212,175,122,0.04), rgba(212,175,122,0.01)) !important;
+    box-shadow: 0 0 0 1px rgba(212,175,122,0.2) inset, 0 6px 20px rgba(0,0,0,0.4);
+  }
+  .summon-btn:not(:disabled)::before, .summon-btn:not(:disabled)::after {
+    content: '❋';
+    color: var(--gold); opacity: 0.6;
+    font-size: 11px;
+    transition: opacity .6s ease, transform .6s ease;
+  }
+  .summon-btn:not(:disabled):hover {
+    box-shadow:
+      0 0 0 1px var(--gold) inset,
+      0 0 30px rgba(212,175,122,0.25),
+      0 10px 30px rgba(0,0,0,0.6) !important;
+  }
+  .summon-btn:not(:disabled):hover::before,
+  .summon-btn:not(:disabled):hover::after {
+    opacity: 1;
+    transform: rotate(180deg);
+  }
+  .summon-btn:disabled::before, .summon-btn:disabled::after { display: none; }
+
+  /* === Loader 升级: 同心金环 + 中央紫色心跳 === */
+  .loader-orb {
+    position: relative;
+    width: 100px !important; height: 100px !important;
+  }
+  .loader-orb::before, .loader-orb::after {
+    content: '';
+    position: absolute; inset: 0;
+    border: 1px solid rgba(212,175,122,0.45);
+    border-radius: 50%;
+    pointer-events: none;
+  }
+  .loader-orb::before {
+    animation: ringSpin 8s linear infinite;
+    border-style: dashed;
+  }
+  .loader-orb::after {
+    inset: -16px;
+    border-color: rgba(212,175,122,0.25);
+    animation: ringSpin 18s linear infinite reverse;
+  }
+  @keyframes ringSpin { to { transform: rotate(360deg); } }
+
+  /* === Top nav 加点装饰 === */
+  .top-nav a, .top-nav span {
+    transition: color .4s ease, letter-spacing .4s ease;
+  }
+  .top-nav a:hover { letter-spacing: 0.4em; }
+
+  /* === Skip link 升级 === */
+  .skip-link {
+    border-bottom: none !important;
+    position: relative; padding: 8px 18px !important;
+    transition: color .4s ease, background .4s ease;
+  }
+  .skip-link::before, .skip-link::after {
+    content: ''; position: absolute; top: 50%;
+    width: 16px; height: 1px;
+    background: rgba(212,175,122,0.4);
+    transform: translateY(-50%);
+    transition: width .4s ease, background .4s ease;
+  }
+  .skip-link::before { right: 100%; margin-right: 8px; }
+  .skip-link::after  { left:  100%; margin-left:  8px; }
+  .skip-link:hover { color: var(--gold) !important; }
+  .skip-link:hover::before, .skip-link:hover::after {
+    background: var(--gold); width: 24px;
+  }
+</style>
 </head>
 <body>
 
@@ -931,7 +1214,9 @@ ${sharedHead}
     <p class="chapter-sub">One sentence. The shorter, the truer.</p>
 
     <div class="echo-input-wrap">
+      <span class="gem-l"></span>
       <textarea id="echoInput" class="echo-input" rows="2" maxlength="140" placeholder="The summer she taught me to swim…"></textarea>
+      <span class="gem-r"></span>
     </div>
     <div class="echo-meta">
       <span class="echo-counter"><span id="echoCount">0</span> / 140</span>
@@ -1543,7 +1828,7 @@ app.get('/api/health', (c) => c.json({
   ai_provider: 'cf-workers-ai (primary) → ai-horde (fallback) → svg',
   ai_binding: !!c.env.AI,
   storage: c.env.DB ? 'd1' : (c.env.ECHO_KV ? 'kv' : 'memory'),
-  version: 'v6.5-live-insert',
+  version: 'v6.6-create-artistry',
 }))
 
 // 诊断端点: 测试 D1 真实读写状态 + 自动迁移
