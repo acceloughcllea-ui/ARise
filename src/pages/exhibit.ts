@@ -182,6 +182,26 @@ export const exhibitHtml = `<!DOCTYPE html>
   .artframe img {
     width: 100%; height: 100%; object-fit: cover; display: block;
   }
+  /* 新作品"入場呼吸": 在 piece 上做個極淡的金光暈, 不動畫畫框本身的 box-shadow */
+  @keyframes pieceArrive {
+    0%   { opacity: 0; transform: scale(0.7); }
+    35%  { opacity: 0.55; transform: scale(1.05); }
+    100% { opacity: 0; transform: scale(1.25); }
+  }
+  .piece-arriving::after {
+    content: '';
+    position: absolute;
+    inset: -4vh -2vw;
+    pointer-events: none;
+    z-index: -1;
+    background: radial-gradient(ellipse at center,
+      rgba(245,220,170,0.28) 0%,
+      rgba(212,175,122,0.14) 35%,
+      transparent 70%);
+    filter: blur(6px);
+    animation: pieceArrive 2.4s ease-out both;
+  }
+
   /* 畫框懸掛線(細鋼絲懸於畫上方延伸至天花) */
   .artframe-wire {
     position: absolute;
@@ -486,7 +506,7 @@ export const exhibitHtml = `<!DOCTYPE html>
 (() => {
   // ===== 走馬燈引擎(弧形透視 / 中央聚焦 / 拖拽滾輪 / 慣性) =====
   const AUTO_SPEED   = 22;             // ↓ 自動滾動 22 px/s(原 60),慢悠悠走馬燈節奏
-  const REFRESH_MS   = 60 * 1000;      // 每 60 秒拉一次新作品
+  const POLL_MS      = 5 * 1000;       // 每 5 秒拉一次新作品(體驗端剛畫完的可立即插隊)
   const FRICTION     = 0.94;           // 拖拽放開後的慣性衰減
   const RESUME_DELAY = 2400;           // 用戶停手 2.4s 後恢復自動滾動
   const WHEEL_GAIN   = 0.7;            // 滾輪敏感度
@@ -614,6 +634,88 @@ export const exhibitHtml = `<!DOCTYPE html>
     });
   }
 
+  // 平滑插隊: 新作 5 秒內從鏡頭右側悠悠飄進來, 不打斷當前滾動
+  function smoothInsertAdditions(added, fullNewItems) {
+    if (!unitWidth || !totalWidth) {
+      // 軌道還沒準備好 -> 退回完整重建
+      items = fullNewItems;
+      rebuildTrack();
+      return;
+    }
+    const oldLen = items.length;
+    items = fullNewItems;  // 更新 items, 跟伺服器一致(新作在最前)
+
+    // 當前可視鏡頭位於 marquee 內的哪個位置?
+    // marquee 上掛了 2 個 pass, pass1 在 [0, totalWidth), pass2 在 [totalWidth, 2*totalWidth)
+    // offset 是當前已平移距離, 鏡頭中心 X (在 marquee 坐標系) 約等於 offset + viewportCenter
+    const viewportCenter = window.innerWidth / 2;
+    const cameraX = offset + viewportCenter;
+
+    // 我們要在"鏡頭右側 1.5 個 piece 寬度處"插入新作 ——
+    // 這個距離: 既不會立刻跳出, 也不會等太久, 大約 1~3 秒內滑進鏡頭中央
+    const insertAheadPx = unitWidth * 1.5;
+    let insertX = cameraX + insertAheadPx;
+
+    // pass1 / pass2 都要在對應位置插, 才能保持雙串無縫
+    // pass1 索引範圍 [0, oldLen), pass2 索引範圍 [oldLen, 2*oldLen)
+    // pass1 piece i 的中心 X = (i + 0.5) * unitWidth
+    // pass2 piece i 的中心 X = totalWidth + (i + 0.5) * unitWidth
+    // 找 pass1 內第一個中心 X >= insertX 的位置 k
+    // (如果 insertX > totalWidth, 就找 pass2 內對應位置, 取 mod)
+    let insertModulo = insertX % totalWidth;
+    if (insertModulo < 0) insertModulo += totalWidth;
+    let k = Math.ceil(insertModulo / unitWidth);  // 在 pass1 內的 [0, oldLen] 位置
+    if (k > oldLen) k = oldLen;
+    if (k < 0) k = 0;
+
+    // 新節點 (added 排序: /api/exhibit 是 createdAt DESC, 所以 added 也是新的在前)
+    // 為了讓多張同批新作按時間順序連著出現, 倒著插入(最新的最後插, 出現在最遠處)
+    const insertAt_pass1 = k;
+    const insertAt_pass2 = oldLen + k;  // pass2 的相對位置 (在插入新作前的索引)
+
+    // 先在 pass2 插, 再在 pass1 插 —— 因為先插 pass1 會讓 pass2 的索引前移
+    // pass2 對應的 DOM 索引: oldLen * 2 = 整個 marquee 共 2*oldLen 個節點
+    // 插入後新節點數 = oldLen + added.length, 雙串總數 = 2*(oldLen + added.length)
+    const insertAtDom_pass2 = oldLen + k;   // 在 pass2 那段內的索引
+    const insertAtDom_pass1 = k;
+
+    // 為了視覺對稱, pass2 也插入同樣的新作 (因為循環時鏡頭會從 pass2 看到這批新作)
+    // 順序: added 按時間從舊到新插入, 這樣最新作品出現在最右側
+    const orderedAdded = added.slice().reverse();  // 反轉:從最舊到最新
+
+    // 構造 DOM 節點 (pass1 + pass2 各一份)
+    const pass1Nodes = orderedAdded.map(it => buildPiece(it));
+    const pass2Nodes = orderedAdded.map(it => buildPiece(it));
+
+    // 插入 pass2 (從後往前, 不影響 pass1 索引)
+    const childrenBefore = marquee.children;
+    const pass2RefNode = childrenBefore[insertAtDom_pass2] || null;
+    for (let i = 0; i < pass2Nodes.length; i++) {
+      marquee.insertBefore(pass2Nodes[i], pass2RefNode);
+    }
+    // 插入 pass1
+    // 注意: pass2 已插入了 added.length 個節點到 [oldLen+k, oldLen+k+added.length), 但這在 pass1 之後, 不影響 pass1 索引
+    const childrenAfterPass2 = marquee.children;
+    const pass1RefNode = childrenAfterPass2[insertAtDom_pass1] || null;
+    for (let i = 0; i < pass1Nodes.length; i++) {
+      marquee.insertBefore(pass1Nodes[i], pass1RefNode);
+    }
+
+    // 重新計算 totalWidth ; offset 保持不變 (鏡頭視角穩定)
+    const newLen = items.length;
+    totalWidth = unitWidth * newLen;
+
+    // 邊界: 如果 offset 因 totalWidth 變化超範圍, 校正
+    while (offset >= totalWidth) offset -= totalWidth;
+    while (offset < 0)            offset += totalWidth;
+
+    // 給新插入的 piece 加一個極淡的"入場呼吸"標記, 不打斷節奏
+    [...pass1Nodes, ...pass2Nodes].forEach(node => {
+      node.classList.add('piece-arriving');
+      setTimeout(() => node.classList.remove('piece-arriving'), 2400);
+    });
+  }
+
   function tick(now) {
     const dt = Math.min(0.05, (now - lastT) / 1000);
     lastT = now;
@@ -647,9 +749,6 @@ export const exhibitHtml = `<!DOCTYPE html>
       const data = await r.json();
       const newItems = data.items || [];
 
-      const prevKey = items.map(x=>x.id).join('|');
-      const newKey = newItems.map(x=>x.id).join('|');
-
       if (!newItems.length) {
         items = [];
         emptyEl.style.display = 'flex';
@@ -661,10 +760,39 @@ export const exhibitHtml = `<!DOCTYPE html>
       emptyEl.style.display = 'none';
       cornerCount.textContent = newItems.length + ' pieces';
 
-      if (prevKey !== newKey) {
+      // 首次加載 -> 直接建軌
+      if (!items.length) {
         items = newItems;
         rebuildTrack();
+        return;
       }
+
+      // 計算差異: 是純新增 (delete/edit/reorder 走整建)
+      const prevIds = new Set(items.map(x => x.id));
+      const newIds  = new Set(newItems.map(x => x.id));
+      const added   = newItems.filter(x => !prevIds.has(x.id));
+      const removed = items.filter(x => !newIds.has(x.id));
+
+      // 結構性變化 (刪除/編輯/重排) -> 完整重建
+      // 注意: 編輯只改 title/curatorNote, id 不變, 所以下面這個 hash 用 id+title+curatorNote 判斷
+      const prevHash = items.map(x => x.id + ':' + (x.title||'') + ':' + (x.curatorNote||'')).join('|');
+      const newHash  = newItems.map(x => x.id + ':' + (x.title||'') + ':' + (x.curatorNote||'')).join('|');
+      const onlyAdditions = removed.length === 0 && added.length > 0;
+      const hasEditsOrReorder = !onlyAdditions && prevHash !== newHash;
+
+      if (hasEditsOrReorder || removed.length > 0) {
+        items = newItems;
+        rebuildTrack();
+        return;
+      }
+      if (added.length === 0) return;  // 啥也沒變
+
+      // === 純新增: 平滑插隊, 不重建軌道 ===
+      // 策略:
+      // 1. items 用新列表(/api/exhibit 已是按 createdAt DESC 排序, 新作在前)
+      // 2. 在當前可視窗口右側不遠處插入新作 DOM (兩個 pass 都要插, 才能無縫循環)
+      // 3. 重新計算 totalWidth, 不動 offset, 視覺上等於"新畫從右邊飄進鏡頭"
+      smoothInsertAdditions(added, newItems);
     } catch (e) {
       console.warn('exhibit fetch failed', e);
     }
@@ -717,7 +845,7 @@ export const exhibitHtml = `<!DOCTYPE html>
   // 啟動
   fetchData();
   rafId = requestAnimationFrame(tick);
-  setInterval(fetchData, REFRESH_MS);
+  setInterval(fetchData, POLL_MS);
 
   // 跨頁同步: 從 archive 回來 (visibility change) 立即刷新
   document.addEventListener('visibilitychange', () => {
