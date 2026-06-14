@@ -106,6 +106,23 @@ async function ensureD1Schema(db: D1Database): Promise<void> {
   } catch (e) {
     console.warn('[D1 schema] outer error:', (e as Error)?.message)
   }
+  // === Step 6: 给历史的 createdAt=0 老画补一个伪时间戳, 让它们能正确排序 ===
+  // 基准: 2024-01-01 起每条 +1 秒, 按 id 字典序分配
+  // 这样旧画排在新画(2025+)之后, 但旧画之间也有相对顺序
+  try {
+    const oldRows = await db.prepare("SELECT id FROM echoes WHERE createdAt = 0 ORDER BY id ASC").all<{id: string}>()
+    const results = oldRows.results ?? []
+    if (results.length > 0) {
+      const baseTs = new Date('2024-01-01T00:00:00Z').getTime()
+      for (let i = 0; i < results.length; i++) {
+        const fakeTs = baseTs + i * 1000  // 每条间隔 1 秒
+        await db.prepare("UPDATE echoes SET createdAt = ? WHERE id = ? AND createdAt = 0").bind(fakeTs, results[i].id).run()
+      }
+      console.log(`[D1 backfill] assigned pseudo timestamps to ${results.length} legacy rows`)
+    }
+  } catch (e) {
+    console.warn('[D1 backfill] error:', (e as Error)?.message)
+  }
 }
 
 async function saveEcho(env: Bindings, id: string, record: EchoRecord): Promise<{d1: string; kv: string; mem: boolean}> {
@@ -1828,7 +1845,7 @@ app.get('/api/health', (c) => c.json({
   ai_provider: 'cf-workers-ai (primary) → ai-horde (fallback) → svg',
   ai_binding: !!c.env.AI,
   storage: c.env.DB ? 'd1' : (c.env.ECHO_KV ? 'kv' : 'memory'),
-  version: 'v6.6-create-artistry',
+  version: 'v6.7-archive-artistry-and-backfill',
 }))
 
 // 诊断端点: 测试 D1 真实读写状态 + 自动迁移

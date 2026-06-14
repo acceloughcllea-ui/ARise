@@ -138,6 +138,224 @@ export const archiveHtml = `<!DOCTYPE html>
   }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 </style>
+
+<!-- ===== Artistic Layer v6.7: 储存端美术馆升级(与 /exhibit + /create 统一) ===== -->
+<style>
+  /* 大氛围: 深紫穹顶 + 金尘 + 噪点墙面 */
+  body {
+    background:
+      radial-gradient(ellipse 90% 60% at 50% 110%, rgba(60,40,90,0.4) 0%, transparent 60%),
+      radial-gradient(ellipse 70% 50% at 50% 0%, rgba(159,122,234,0.18) 0%, transparent 55%),
+      radial-gradient(ellipse at 50% 50%, #1a1130 0%, #0a0612 50%, #050309 100%);
+    min-height: 100vh; position: relative;
+  }
+  body::before {
+    content: ''; position: fixed; inset: 0;
+    pointer-events: none; z-index: 0; opacity: 0.85;
+    background-image:
+      radial-gradient(1px 1px at 8% 22%, rgba(212,175,122,0.65), transparent 50%),
+      radial-gradient(1.2px 1.2px at 78% 35%, rgba(212,175,122,0.55), transparent 50%),
+      radial-gradient(1px 1px at 35% 70%, rgba(212,175,122,0.6), transparent 50%),
+      radial-gradient(1.3px 1.3px at 88% 82%, rgba(212,175,122,0.45), transparent 50%),
+      radial-gradient(1px 1px at 22% 88%, rgba(212,175,122,0.5), transparent 50%),
+      radial-gradient(1px 1px at 60% 12%, rgba(212,175,122,0.5), transparent 50%),
+      radial-gradient(0.8px 0.8px at 48% 48%, rgba(245,220,170,0.7), transparent 50%),
+      radial-gradient(0.8px 0.8px at 92% 18%, rgba(212,175,122,0.4), transparent 50%);
+  }
+  body::after {
+    content: ''; position: fixed; inset: 0;
+    pointer-events: none; z-index: 0; opacity: 0.5; mix-blend-mode: overlay;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.83  0 0 0 0 0.68  0 0 0 0 0.48  0 0 0 0.08 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    background-size: 240px 240px;
+  }
+  .top-bar-a, .archive-head, .archive-grid, .modal-backdrop, .toast {
+    position: relative; z-index: 1;
+  }
+  .modal-backdrop { z-index: 100; }
+  .toast { z-index: 200; }
+
+  /* === 标题区: 装饰强化 === */
+  .archive-head {
+    padding-top: 150px !important;
+  }
+  .archive-head .eyebrow {
+    display: inline-block;
+    padding: 0 28px;
+    position: relative;
+  }
+  .archive-head .eyebrow::before, .archive-head .eyebrow::after {
+    content: '';
+    position: absolute; top: 50%;
+    width: 36px; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--gold));
+    opacity: 0.7;
+  }
+  .archive-head .eyebrow::before { right: 100%; transform: translate(0, -50%) scaleX(-1); }
+  .archive-head .eyebrow::after  { left:  100%; transform: translateY(-50%); }
+  .archive-head h1::first-letter {
+    color: var(--gold);
+    font-size: 1.3em;
+  }
+  /* 标题底下加一根带宝石的细金线 */
+  .archive-head::after {
+    content: '✦';
+    display: block;
+    color: var(--gold);
+    font-size: 12px;
+    margin: 32px auto 0;
+    text-shadow: 0 0 12px rgba(212,175,122,0.5);
+    opacity: 0.9;
+  }
+
+  /* === 卡片升级: 5 层镏金装裱(与 exhibit 的画框一致) === */
+  .archive-card .frame-mini {
+    box-shadow:
+      0 0 0 2px #0e0a18,
+      0 0 0 4px #2a1d0e,
+      0 0 0 7px var(--gold),
+      0 0 0 8px #8a6534,
+      0 0 0 10px rgba(212,175,122,0.5),
+      0 18px 40px rgba(0,0,0,0.85),
+      0 0 60px var(--card-glow, rgba(159,122,234,0.16)) !important;
+    transition: box-shadow .6s ease;
+  }
+  .archive-card:hover .frame-mini {
+    box-shadow:
+      0 0 0 2px #0e0a18,
+      0 0 0 4px #2a1d0e,
+      0 0 0 7px #f5dca8,
+      0 0 0 8px #8a6534,
+      0 0 0 10px rgba(245,220,170,0.65),
+      0 24px 50px rgba(0,0,0,0.9),
+      0 0 100px var(--card-glow, rgba(159,122,234,0.32)) !important;
+  }
+  /* 玻璃斜光高光 */
+  .archive-card .frame-mini {
+    position: relative;
+  }
+  .archive-card .frame-mini::after {
+    content: ''; position: absolute; inset: 0;
+    background: linear-gradient(135deg, rgba(255,235,200,0.14) 0%, transparent 28%, transparent 65%, rgba(0,0,0,0.38) 100%);
+    pointer-events: none;
+    z-index: 1;
+  }
+  .archive-card .frame-mini img {
+    position: relative; z-index: 0;
+  }
+
+  /* === 卡片元数据区:序号+标题+voice 重新排版,纸卷美术馆标签感 === */
+  .archive-card .meta {
+    padding: 22px 8px 0 !important;
+    text-align: center;
+    position: relative;
+  }
+  .archive-card .meta::before {
+    content: '';
+    display: block;
+    width: 28px; height: 1px;
+    background: var(--gold);
+    margin: 0 auto 14px;
+    opacity: 0.7;
+  }
+  .archive-card .num {
+    font-size: 9.5px !important;
+    letter-spacing: 0.4em !important;
+    margin-bottom: 8px !important;
+    opacity: 0.9;
+  }
+  .archive-card .title {
+    font-style: italic;
+    font-size: 17px !important;
+    color: #f5ede0;
+  }
+  .archive-card .voice {
+    margin-top: 10px !important;
+    letter-spacing: 0.32em !important;
+  }
+  .archive-card .voice .swatch {
+    width: 8px !important; height: 8px !important;
+    box-shadow: 0 0 8px currentColor !important;
+  }
+
+  /* === Hover 时编辑/删除按钮升级为镏金小按钮 === */
+  .archive-card .actions {
+    padding-top: 14px !important;
+    gap: 8px !important;
+  }
+  .archive-card .actions button {
+    background: rgba(10,6,18,0.65) !important;
+    backdrop-filter: blur(6px);
+    border: 1px solid rgba(212,175,122,0.4) !important;
+    transition: all .3s ease !important;
+  }
+  .archive-card .actions button:hover {
+    background: rgba(212,175,122,0.15) !important;
+    color: var(--gold) !important;
+    border-color: var(--gold) !important;
+    transform: translateY(-1px);
+  }
+  .archive-card .actions button.del:hover {
+    background: rgba(255,140,140,0.12) !important;
+    color: #ff9a9a !important;
+    border-color: rgba(255,140,140,0.6) !important;
+  }
+
+  /* === 模态框升级为美术馆调子 === */
+  .modal {
+    background: linear-gradient(180deg, #14102a 0%, #0a0612 100%) !important;
+    border: 1px solid rgba(212,175,122,0.3) !important;
+    box-shadow:
+      0 0 0 1px rgba(212,175,122,0.15),
+      0 30px 80px rgba(0,0,0,0.85),
+      0 0 80px rgba(159,122,234,0.15) !important;
+    position: relative;
+  }
+  .modal::before, .modal::after {
+    content: ''; position: absolute;
+    width: 18px; height: 18px;
+    border: 1px solid var(--gold);
+    pointer-events: none;
+  }
+  .modal::before {
+    top: 10px; left: 10px;
+    border-right: none; border-bottom: none;
+  }
+  .modal::after {
+    bottom: 10px; right: 10px;
+    border-left: none; border-top: none;
+  }
+
+  /* === 空态升级 === */
+  .archive-empty {
+    padding: 120px 24px !important;
+    position: relative;
+  }
+  .archive-empty::before {
+    content: '✦';
+    display: block;
+    color: var(--gold);
+    font-size: 24px;
+    margin-bottom: 28px;
+    text-shadow: 0 0 16px rgba(212,175,122,0.6);
+    opacity: 0.8;
+  }
+
+  /* === 移动端微调 === */
+  @media (max-width: 720px) {
+    .archive-head { padding-top: 100px !important; }
+    .archive-head .eyebrow::before, .archive-head .eyebrow::after { width: 20px; }
+    .archive-card .frame-mini {
+      box-shadow:
+        0 0 0 1px #0e0a18,
+        0 0 0 3px #2a1d0e,
+        0 0 0 5px var(--gold),
+        0 0 0 6px #8a6534,
+        0 0 0 8px rgba(212,175,122,0.45),
+        0 14px 30px rgba(0,0,0,0.8),
+        0 0 50px var(--card-glow, rgba(159,122,234,0.16)) !important;
+    }
+  }
+</style>
 </head>
 <body>
 <div class="top-bar-a">
@@ -233,6 +451,8 @@ export const archiveHtml = `<!DOCTYPE html>
         const card = document.createElement('div');
         card.className = 'archive-card';
         card.dataset.id = item.id;
+        // 让每张画的金边光晕取自其 voice 调色板
+        if (item.palette) card.style.setProperty('--card-glow', item.palette + '55');
         card.innerHTML = \`
           <a href="/gallery/\${item.id}" style="display:block;">
             <div class="frame-mini"><img loading="lazy" src="\${item.art}" alt=""/></div>
