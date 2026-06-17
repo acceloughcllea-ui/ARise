@@ -39,6 +39,8 @@ type EchoRecord = {
 // ========== 存储层 (优先 D1, 退而求其次 KV, 最后内存) ==========
 // 用一个模块级标记避免每次请求都跑迁移
 let d1SchemaReady = false
+// 独立的回填 flag - 与 schema flag 分离, 确保每个 worker 实例都会跑一次回填
+let d1BackfillDone = false
 
 async function ensureD1Schema(db: D1Database): Promise<void> {
   if (d1SchemaReady) return
@@ -106,22 +108,39 @@ async function ensureD1Schema(db: D1Database): Promise<void> {
   } catch (e) {
     console.warn('[D1 schema] outer error:', (e as Error)?.message)
   }
-  // === Step 6: 给历史的 createdAt=0 老画补一个伪时间戳, 让它们能正确排序 ===
-  // 基准: 2024-01-01 起每条 +1 秒, 按 id 字典序分配
-  // 这样旧画排在新画(2025+)之后, 但旧画之间也有相对顺序
+}
+
+// ========== 给历史的 createdAt=0 老画补伪时间戳 ==========
+//   - 独立于 ensureD1Schema, 用独立 flag (d1BackfillDone) 控制
+//   - 不依赖 schema 是否刚刚被重建过 —— 只要看到 createdAt=0 的行就执行
+//   - 基准: 2024-01-01 UTC, 按 id 字典序每条 +1 秒
+//   - 返回回填行数, 给 /api/admin/backfill-ts 用
+async function backfillLegacyTimestamps(db: D1Database, force = false): Promise<{ scanned: number; updated: number; error?: string }> {
+  if (d1BackfillDone && !force) return { scanned: 0, updated: 0 }
   try {
-    const oldRows = await db.prepare("SELECT id FROM echoes WHERE createdAt = 0 ORDER BY id ASC").all<{id: string}>()
+    const oldRows = await db.prepare("SELECT id FROM echoes WHERE createdAt = 0 ORDER BY id ASC").all<{ id: string }>()
     const results = oldRows.results ?? []
-    if (results.length > 0) {
-      const baseTs = new Date('2024-01-01T00:00:00Z').getTime()
-      for (let i = 0; i < results.length; i++) {
-        const fakeTs = baseTs + i * 1000  // 每条间隔 1 秒
-        await db.prepare("UPDATE echoes SET createdAt = ? WHERE id = ? AND createdAt = 0").bind(fakeTs, results[i].id).run()
-      }
-      console.log(`[D1 backfill] assigned pseudo timestamps to ${results.length} legacy rows`)
+    if (results.length === 0) {
+      d1BackfillDone = true
+      return { scanned: 0, updated: 0 }
     }
+    const baseTs = new Date('2024-01-01T00:00:00Z').getTime()
+    let updated = 0
+    for (let i = 0; i < results.length; i++) {
+      const fakeTs = baseTs + i * 1000
+      const res = await db
+        .prepare("UPDATE echoes SET createdAt = ? WHERE id = ? AND createdAt = 0")
+        .bind(fakeTs, results[i].id)
+        .run()
+      if ((res as any)?.meta?.changes && (res as any).meta.changes > 0) updated++
+    }
+    d1BackfillDone = true
+    console.log(`[D1 backfill] scanned=${results.length} updated=${updated} (base 2024-01-01 +i sec)`)
+    return { scanned: results.length, updated }
   } catch (e) {
-    console.warn('[D1 backfill] error:', (e as Error)?.message)
+    const msg = (e as Error)?.message || String(e)
+    console.warn('[D1 backfill] error:', msg)
+    return { scanned: 0, updated: 0, error: msg }
   }
 }
 
@@ -130,6 +149,10 @@ async function saveEcho(env: Bindings, id: string, record: EchoRecord): Promise<
   if (env.DB) {
     try {
       await ensureD1Schema(env.DB)
+      // 顺手把历史 createdAt=0 的行补一下时间戳 (用 flag 保护, 每个 worker 实例只跑一次)
+      if (!d1BackfillDone) {
+        await backfillLegacyTimestamps(env.DB)
+      }
       await env.DB.prepare(
         "INSERT OR REPLACE INTO echoes (id, art, text, voice, title, curatorNote, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)"
       ).bind(id, record.art, record.text, record.voice, record.title, record.curatorNote, record.createdAt).run()
@@ -466,50 +489,62 @@ function seededRandom(seed: number) {
 // ========== Pollinations.ai 调用 (免费, 无需 key, Flux 模型, ~1-3s 出图) ==========
 //   - 直接 GET 一个 URL 就拿到 JPEG, 没有排队系统, 比 AI Horde 快几个数量级
 //   - 模型: flux (高质量), 分辨率: 768×768, 用 seed 保证每次不同
+//   - 内置一次重试: 第一次失败/拿到非图片时, 改 seed 再试一次
 //   - 失败/超时时上抛, 由调用方走下一级 fallback (ai-horde -> svg)
 async function generateViaPollinations(prompt: string, seed: number): Promise<string> {
   const encoded = encodeURIComponent(prompt)
-  const url = `https://image.pollinations.ai/prompt/${encoded}?width=768&height=768&model=flux&nologo=true&seed=${seed}`
-
-  // 45s 上限 - Pollinations 正常 1-3s, 给足缓冲应对偶尔的冷启动
-  const resp = await fetch(url, {
-    method: 'GET',
-    headers: {
-      'Accept': 'image/jpeg,image/png,image/*',
-      'User-Agent': 'ARiseGallery/1.0 (+https://arise-echo-gallery-7nz.pages.dev)',
-    },
-    signal: AbortSignal.timeout(45_000),
-  })
-
-  if (!resp.ok) {
-    throw new Error(`pollinations HTTP ${resp.status}`)
+  const tryOnce = async (s: number): Promise<string> => {
+    const url = `https://image.pollinations.ai/prompt/${encoded}?width=768&height=768&model=flux&nologo=true&seed=${s}`
+    // 45s 上限 - Pollinations 正常 1-3s, 给足缓冲应对偶尔的冷启动
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Accept': 'image/jpeg,image/png,image/*',
+        'User-Agent': 'ARiseGallery/1.0 (+https://arise-echo-gallery-7nz.pages.dev)',
+      },
+      signal: AbortSignal.timeout(45_000),
+    })
+    if (!resp.ok) {
+      throw new Error(`pollinations HTTP ${resp.status}`)
+    }
+    const ct = resp.headers.get('content-type') || 'image/jpeg'
+    const arrayBuffer = await resp.arrayBuffer()
+    const bytes = new Uint8Array(arrayBuffer)
+    // 真实 AI 图片至少 10KB, 太小说明拿到了占位/错误页
+    if (bytes.length < 10_000) {
+      throw new Error(`pollinations payload too small ${bytes.length}b`)
+    }
+    // 检查 JPEG/PNG 文件头 (防止拿到 HTML 错误页)
+    const isJpeg = bytes[0] === 0xFF && bytes[1] === 0xD8
+    const isPng = bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47
+    if (!isJpeg && !isPng) {
+      throw new Error(`pollinations not an image (ct=${ct}, magic=${bytes[0].toString(16)}${bytes[1].toString(16)})`)
+    }
+    // base64 编码 (Workers 没有 Buffer, 用 btoa + chunk 处理大数组防爆栈)
+    let bin = ''
+    const CHUNK = 0x8000
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as unknown as number[])
+    }
+    const b64 = btoa(bin)
+    const mime = isPng ? 'image/png' : 'image/jpeg'
+    return `data:${mime};base64,${b64}`
   }
 
-  const ct = resp.headers.get('content-type') || 'image/jpeg'
-  const arrayBuffer = await resp.arrayBuffer()
-  const bytes = new Uint8Array(arrayBuffer)
-
-  // 真实 AI 图片至少 10KB, 太小说明拿到了占位/错误页
-  if (bytes.length < 10_000) {
-    throw new Error(`pollinations payload too small ${bytes.length}b`)
+  try {
+    return await tryOnce(seed)
+  } catch (e1) {
+    const msg1 = (e1 as Error)?.message || String(e1)
+    console.warn('[Pollinations] attempt-1 failed:', msg1, '- retrying with new seed')
+    // 第二次用一个偏移过的 seed, 避免某些 seed 被 Pollinations 内部短暂卡住
+    const altSeed = (seed * 31 + 17) % 1_000_000_000
+    try {
+      return await tryOnce(altSeed)
+    } catch (e2) {
+      const msg2 = (e2 as Error)?.message || String(e2)
+      throw new Error(`pollinations both attempts failed: 1)${msg1} | 2)${msg2}`)
+    }
   }
-
-  // 检查 JPEG/PNG 文件头 (防止拿到 HTML 错误页)
-  const isJpeg = bytes[0] === 0xFF && bytes[1] === 0xD8
-  const isPng = bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47
-  if (!isJpeg && !isPng) {
-    throw new Error(`pollinations not an image (got ${ct}, first bytes ${bytes[0].toString(16)} ${bytes[1].toString(16)})`)
-  }
-
-  // base64 编码 (Workers 没有 Buffer, 用 btoa + chunk 处理大数组防爆栈)
-  let bin = ''
-  const CHUNK = 0x8000
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as unknown as number[])
-  }
-  const b64 = btoa(bin)
-  const mime = isPng ? 'image/png' : 'image/jpeg'
-  return `data:${mime};base64,${b64}`
 }
 
 // ========== AI Horde 调用 (免费, 匿名, 多人并发) ==========
@@ -671,6 +706,10 @@ async function listAllEchoes(env: Bindings): Promise<EchoListItem[]> {
   if (env.DB) {
     try {
       await ensureD1Schema(env.DB)
+      // 顺手回填 createdAt=0 的遗留行 (每个 worker 实例只跑一次)
+      if (!d1BackfillDone) {
+        await backfillLegacyTimestamps(env.DB)
+      }
       const { results } = await env.DB.prepare(
         "SELECT id, art, text, voice, title, curatorNote, createdAt FROM echoes ORDER BY createdAt DESC LIMIT 1000"
       ).all<{ id: string } & EchoRecord>()
@@ -1915,8 +1954,28 @@ app.get('/api/health', (c) => c.json({
   ai_provider: 'cf-workers-ai (L1) → pollinations.ai/flux (L2) → ai-horde (L3) → svg (L4)',
   ai_binding: !!c.env.AI,
   storage: c.env.DB ? 'd1' : (c.env.ECHO_KV ? 'kv' : 'memory'),
-  version: 'v6.8-pollinations-primary',
+  d1_schema_ready: d1SchemaReady,
+  d1_backfill_done: d1BackfillDone,
+  version: 'v6.8.1-backfill-and-resilience',
 }))
+
+// 管理端点: 手动强制回填遗留 createdAt=0 时间戳
+//   - 即使 flag 已经是 true 也会再扫一次
+//   - 返回扫描/更新行数, 便于诊断
+app.post('/api/admin/backfill-ts', async (c) => {
+  if (!c.env.DB) return c.json({ error: 'no D1 binding' }, 500)
+  await ensureD1Schema(c.env.DB)
+  const result = await backfillLegacyTimestamps(c.env.DB, true)
+  return c.json({ ok: true, ...result, d1_backfill_done: d1BackfillDone })
+})
+
+// 同样支持 GET, 方便浏览器直接打开触发
+app.get('/api/admin/backfill-ts', async (c) => {
+  if (!c.env.DB) return c.json({ error: 'no D1 binding' }, 500)
+  await ensureD1Schema(c.env.DB)
+  const result = await backfillLegacyTimestamps(c.env.DB, true)
+  return c.json({ ok: true, ...result, d1_backfill_done: d1BackfillDone })
+})
 
 // 诊断端点: 测试 D1 真实读写状态 + 自动迁移
 app.get('/api/diag/db', async (c) => {
@@ -1983,30 +2042,81 @@ app.get('/api/diag/db', async (c) => {
   return c.json(out)
 })
 
-// 诊断端点: 测试 AI binding 是否真的能出图, 不写库
+// 诊断端点: 把全链路 AI 提供商都打一遍, 报告各自健康状况
+//   - 用 ?full=1 才会真的调用 Pollinations (调用一次会消耗 ~5s + 100KB 流量)
+//   - 默认只测 L1 (CF Workers AI), 因为它在生产环境本来就常驻
 app.get('/api/diag/ai', async (c) => {
-  if (!c.env.AI) {
-    return c.json({ ok: false, error: 'AI binding not bound to this Pages project' }, 500)
+  const full = c.req.query('full') === '1'
+  const probe = 'a single small red circle on dark background, minimalist'
+  const seed = 12345
+  const out: any = {
+    timestamp: new Date().toISOString(),
+    layers: {} as Record<string, any>,
   }
+
+  // === L1: Cloudflare Workers AI ===
+  if (c.env.AI) {
+    try {
+      const t0 = Date.now()
+      const aiResp: any = await c.env.AI.run('@cf/black-forest-labs/flux-1-schnell', {
+        prompt: probe,
+        steps: 4,
+        seed,
+      })
+      const ms = Date.now() - t0
+      const imgLen = aiResp && typeof aiResp.image === 'string' ? aiResp.image.length : 0
+      out.layers.cf_workers_ai = { ok: imgLen > 1000, ms, imgLen, sample: imgLen > 1000 ? aiResp.image.slice(0, 60) + '...' : null }
+    } catch (e: any) {
+      out.layers.cf_workers_ai = { ok: false, error: (e?.message || String(e)).slice(0, 300) }
+    }
+  } else {
+    out.layers.cf_workers_ai = { ok: false, error: 'AI binding not bound', binding: false }
+  }
+
+  // === L2: Pollinations.ai (only if ?full=1) ===
+  if (full) {
+    try {
+      const t0 = Date.now()
+      const img = await generateViaPollinations(probe, seed)
+      const ms = Date.now() - t0
+      out.layers.pollinations = { ok: true, ms, imgLen: img.length, sample: img.slice(0, 60) + '...' }
+    } catch (e: any) {
+      out.layers.pollinations = { ok: false, error: (e?.message || String(e)).slice(0, 300) }
+    }
+  } else {
+    out.layers.pollinations = { skipped: 'use ?full=1 to test (costs ~5s + 100KB)' }
+  }
+
+  // === L3: AI Horde queue depth (lightweight - 只看状态, 不真出图) ===
   try {
     const t0 = Date.now()
-    const aiResp: any = await c.env.AI.run('@cf/black-forest-labs/flux-1-schnell', {
-      prompt: 'a single small red circle on dark background, minimalist',
-      steps: 4,
-      seed: 12345,
+    const r = await fetch('https://stablehorde.net/api/v2/status/performance', {
+      headers: { 'Client-Agent': 'ARiseGallery:diag:https://arise-echo-gallery-7nz.pages.dev' },
+      signal: AbortSignal.timeout(10_000),
     })
     const ms = Date.now() - t0
-    const imgLen = aiResp && typeof aiResp.image === 'string' ? aiResp.image.length : 0
-    return c.json({
-      ok: imgLen > 1000,
-      ms,
-      imgLen,
-      respKeys: aiResp ? Object.keys(aiResp) : [],
-      sample: imgLen > 1000 ? aiResp.image.slice(0, 80) + '...' : null,
-    })
+    if (r.ok) {
+      const d: any = await r.json()
+      out.layers.ai_horde = {
+        ok: true,
+        ms,
+        queued_requests: d.queued_requests,
+        worker_count: d.worker_count,
+        queued_megapixelsteps: d.queued_megapixelsteps,
+        verdict: d.queued_requests > 100 ? 'overloaded - prefer pollinations' : 'usable',
+      }
+    } else {
+      out.layers.ai_horde = { ok: false, error: `HTTP ${r.status}`, ms }
+    }
   } catch (e: any) {
-    return c.json({ ok: false, error: e?.message || String(e), stack: (e?.stack || '').slice(0, 500) }, 500)
+    out.layers.ai_horde = { ok: false, error: (e?.message || String(e)).slice(0, 200) }
   }
+
+  // === L4: SVG fallback - always available ===
+  out.layers.svg_placeholder = { ok: true, note: 'always available, last-resort' }
+
+  c.header('Cache-Control', 'no-store')
+  return c.json(out)
 })
 
 export default app
