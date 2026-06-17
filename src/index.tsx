@@ -326,9 +326,30 @@ app.post('/api/generate', async (c) => {
     }
 
     // ============================================================
-    // L2 备用: AI Horde (免费、匿名、社区驱动)
-    //   - 仅当 CF Workers AI 失败时启用
-    //   - 已在沙盒实测可用 ~40s 一张图
+    // L2 备用 (NEW): Pollinations.ai (免费, Flux 模型, ~1-3s 出图)
+    //   - 实测 1.3s 出一张 768×768 JPEG, 比 AI Horde 快几个数量级
+    //   - 没有队列, 没有 worker 短缺问题, 不需要 API key
+    //   - 是当前生产环境最稳定的 AI 后备
+    // ============================================================
+    if (!base64Image) {
+      try {
+        base64Image = await generateViaPollinations(artPrompt, seed)
+        if (base64Image) {
+          providerUsed = 'pollinations'
+          debug.push(`pollinations: ok (${base64Image.length} chars)`)
+        }
+      } catch (e) {
+        const msg = (e as Error)?.message || String(e)
+        console.warn('[Pollinations] error:', msg)
+        debug.push(`pollinations: error ${msg}`)
+      }
+    }
+
+    // ============================================================
+    // L3 最后的 AI 兜底: AI Horde (免费, 匿名, 社区算力)
+    //   - 当 Pollinations 也失败时使用
+    //   - 注意: 高峰时段队列可能 200+ 任务, 等待 2-10 分钟
+    //   - 因此只作为最后一道 AI 防线, 不再是主力
     // ============================================================
     if (!base64Image) {
       try {
@@ -345,7 +366,7 @@ app.post('/api/generate', async (c) => {
     }
 
     // ============================================================
-    // L3 最后兜底: SVG 占位艺术 (按 seed 变化, 不再千篇一律)
+    // L4 最终兜底: SVG 占位艺术 (按 seed 变化, 不再千篇一律)
     // ============================================================
     if (!base64Image) {
       base64Image = makePlaceholderArt(voice.palette, voiceKey, seed)
@@ -440,6 +461,55 @@ function seededRandom(seed: number) {
     s = (s * 1664525 + 1013904223) >>> 0
     return s / 0xFFFFFFFF
   }
+}
+
+// ========== Pollinations.ai 调用 (免费, 无需 key, Flux 模型, ~1-3s 出图) ==========
+//   - 直接 GET 一个 URL 就拿到 JPEG, 没有排队系统, 比 AI Horde 快几个数量级
+//   - 模型: flux (高质量), 分辨率: 768×768, 用 seed 保证每次不同
+//   - 失败/超时时上抛, 由调用方走下一级 fallback (ai-horde -> svg)
+async function generateViaPollinations(prompt: string, seed: number): Promise<string> {
+  const encoded = encodeURIComponent(prompt)
+  const url = `https://image.pollinations.ai/prompt/${encoded}?width=768&height=768&model=flux&nologo=true&seed=${seed}`
+
+  // 45s 上限 - Pollinations 正常 1-3s, 给足缓冲应对偶尔的冷启动
+  const resp = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Accept': 'image/jpeg,image/png,image/*',
+      'User-Agent': 'ARiseGallery/1.0 (+https://arise-echo-gallery-7nz.pages.dev)',
+    },
+    signal: AbortSignal.timeout(45_000),
+  })
+
+  if (!resp.ok) {
+    throw new Error(`pollinations HTTP ${resp.status}`)
+  }
+
+  const ct = resp.headers.get('content-type') || 'image/jpeg'
+  const arrayBuffer = await resp.arrayBuffer()
+  const bytes = new Uint8Array(arrayBuffer)
+
+  // 真实 AI 图片至少 10KB, 太小说明拿到了占位/错误页
+  if (bytes.length < 10_000) {
+    throw new Error(`pollinations payload too small ${bytes.length}b`)
+  }
+
+  // 检查 JPEG/PNG 文件头 (防止拿到 HTML 错误页)
+  const isJpeg = bytes[0] === 0xFF && bytes[1] === 0xD8
+  const isPng = bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47
+  if (!isJpeg && !isPng) {
+    throw new Error(`pollinations not an image (got ${ct}, first bytes ${bytes[0].toString(16)} ${bytes[1].toString(16)})`)
+  }
+
+  // base64 编码 (Workers 没有 Buffer, 用 btoa + chunk 处理大数组防爆栈)
+  let bin = ''
+  const CHUNK = 0x8000
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as unknown as number[])
+  }
+  const b64 = btoa(bin)
+  const mime = isPng ? 'image/png' : 'image/jpeg'
+  return `data:${mime};base64,${b64}`
 }
 
 // ========== AI Horde 调用 (免费, 匿名, 多人并发) ==========
@@ -1842,10 +1912,10 @@ app.get('/favicon.ico', (c) => {
 app.get('/api/health', (c) => c.json({
   ok: true,
   service: 'ARise · Echo Gallery',
-  ai_provider: 'cf-workers-ai (primary) → ai-horde (fallback) → svg',
+  ai_provider: 'cf-workers-ai (L1) → pollinations.ai/flux (L2) → ai-horde (L3) → svg (L4)',
   ai_binding: !!c.env.AI,
   storage: c.env.DB ? 'd1' : (c.env.ECHO_KV ? 'kv' : 'memory'),
-  version: 'v6.7-archive-artistry-and-backfill',
+  version: 'v6.8-pollinations-primary',
 }))
 
 // 诊断端点: 测试 D1 真实读写状态 + 自动迁移
