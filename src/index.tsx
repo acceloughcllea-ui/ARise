@@ -1956,7 +1956,7 @@ app.get('/api/health', (c) => c.json({
   storage: c.env.DB ? 'd1' : (c.env.ECHO_KV ? 'kv' : 'memory'),
   d1_schema_ready: d1SchemaReady,
   d1_backfill_done: d1BackfillDone,
-  version: 'v6.8.1-backfill-and-resilience',
+  version: 'v6.8.2-placeholder-cleanup',
 }))
 
 // 管理端点: 手动强制回填遗留 createdAt=0 时间戳
@@ -1975,6 +1975,99 @@ app.get('/api/admin/backfill-ts', async (c) => {
   await ensureD1Schema(c.env.DB)
   const result = await backfillLegacyTimestamps(c.env.DB, true)
   return c.json({ ok: true, ...result, d1_backfill_done: d1BackfillDone })
+})
+
+// 管理端点: 清理所有 SVG 占位废品 (v6.8 之前 AI Horde 超时产生的)
+//   - 判定规则: art 字段以 data:image/svg 开头 = 废品 (真 AI 图都是 JPEG/PNG/WebP)
+//   - 默认 dry-run, 不真删, 返回会被删的列表给人工核对
+//   - 加 ?execute=1 才真删, 同时清掉 D1 + KV + 内存
+//   - 返回各层删除结果, 便于追踪
+async function cleanupPlaceholders(env: Bindings, execute: boolean): Promise<any> {
+  const out: any = {
+    execute,
+    scanned: 0,
+    placeholder_ids: [] as Array<{ id: string; title: string; art_len: number; art_prefix: string }>,
+    d1: { attempted: 0, deleted: 0, errors: [] as string[] },
+    kv: { attempted: 0, deleted: 0, errors: [] as string[] },
+    mem: { attempted: 0, deleted: 0 },
+  }
+
+  if (!env.DB) {
+    out.error = 'no D1 binding'
+    return out
+  }
+  await ensureD1Schema(env.DB)
+
+  // 1) 扫描所有 SVG 废品
+  try {
+    const { results } = await env.DB.prepare(
+      "SELECT id, title, art FROM echoes WHERE art LIKE 'data:image/svg%' ORDER BY createdAt DESC"
+    ).all<{ id: string; title: string; art: string }>()
+    const rows = results ?? []
+    out.scanned = rows.length
+    out.placeholder_ids = rows.map(r => ({
+      id: r.id,
+      title: r.title || '',
+      art_len: r.art?.length || 0,
+      art_prefix: (r.art || '').slice(0, 40),
+    }))
+  } catch (e) {
+    out.error = `scan failed: ${(e as Error)?.message}`
+    return out
+  }
+
+  if (!execute) {
+    out.note = 'dry-run only. Add ?execute=1 to actually delete.'
+    return out
+  }
+
+  const ids = out.placeholder_ids.map((r: any) => r.id as string)
+
+  // 2) 真删 D1
+  for (const id of ids) {
+    out.d1.attempted++
+    try {
+      const res = await env.DB.prepare("DELETE FROM echoes WHERE id = ?").bind(id).run()
+      if ((res as any)?.meta?.changes && (res as any).meta.changes > 0) out.d1.deleted++
+    } catch (e) {
+      out.d1.errors.push(`${id}: ${(e as Error)?.message?.slice(0, 80)}`)
+    }
+  }
+
+  // 3) 清 KV
+  if (env.ECHO_KV) {
+    for (const id of ids) {
+      out.kv.attempted++
+      try {
+        await env.ECHO_KV.delete(`echo:${id}`)
+        out.kv.deleted++
+      } catch (e) {
+        out.kv.errors.push(`${id}: ${(e as Error)?.message?.slice(0, 80)}`)
+      }
+    }
+  }
+
+  // 4) 清内存
+  for (const id of ids) {
+    out.mem.attempted++
+    if (memoryStore.delete(id)) out.mem.deleted++
+  }
+
+  return out
+}
+
+app.get('/api/admin/cleanup-placeholders', async (c) => {
+  const execute = c.req.query('execute') === '1'
+  const result = await cleanupPlaceholders(c.env, execute)
+  c.header('Cache-Control', 'no-store')
+  return c.json(result)
+})
+
+app.post('/api/admin/cleanup-placeholders', async (c) => {
+  const execute = c.req.query('execute') === '1'
+  const result = await cleanupPlaceholders(c.env, execute)
+  c.header('Cache-Control', 'no-store')
+  return c.json(result)
 })
 
 // 诊断端点: 测试 D1 真实读写状态 + 自动迁移
