@@ -3,6 +3,7 @@ import { cors } from 'hono/cors'
 import { indexHtml } from './pages/index'
 import { exhibitHtml } from './pages/exhibit'
 import { archiveHtml } from './pages/archive'
+import { adminHtml } from './pages/admin'
 
 type Bindings = {
   HF_TOKEN?: string
@@ -23,6 +24,11 @@ app.get('/exhibit', (c) => c.html(exhibitHtml))
 // /archive  · The Archive (从 arise-echo-gallery-7nz.pages.dev 复刻)
 // ===================================================================
 app.get('/archive', (c) => c.html(archiveHtml))
+
+// ===================================================================
+// /admin  · 管理面板 (搜索 / 编辑 / 删除 / 批量删除 / 一键清理废品)
+// ===================================================================
+app.get('/admin', (c) => c.html(adminHtml))
 
 // ========== 内存兜底 ==========
 const memoryStore = new Map<string, EchoRecord>()
@@ -1956,7 +1962,7 @@ app.get('/api/health', (c) => c.json({
   storage: c.env.DB ? 'd1' : (c.env.ECHO_KV ? 'kv' : 'memory'),
   d1_schema_ready: d1SchemaReady,
   d1_backfill_done: d1BackfillDone,
-  version: 'v6.8.2-placeholder-cleanup',
+  version: 'v6.9-admin-panel',
 }))
 
 // 管理端点: 手动强制回填遗留 createdAt=0 时间戳
